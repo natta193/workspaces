@@ -85,7 +85,7 @@ def main():
             '--channel',       'unlisted',
             '--source-dir',    str(ROOT),
             '--artifacts-dir', str(artifacts_dir),
-            '--timeout',       '300000',
+            '--timeout',       '900000',
         ],
         env={**os.environ},
     )

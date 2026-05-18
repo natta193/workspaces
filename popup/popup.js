@@ -6,10 +6,11 @@ const state = {
   colors: [],
   currentWorkspaceId: null,
   currentWindowId: null,
-  windowWorkspaceMap: {}
+  windowWorkspaceMap: {},
+  lastSyncAt: null,
+  quota: null,
 };
 
-// Current form mode: 'create' | 'edit'
 let formMode = 'create';
 let formFromCurrent = false;
 let formWorkspaceId = null;
@@ -32,6 +33,39 @@ function show(name) {
   for (const [k, el] of Object.entries(V)) el.classList.toggle('on', k === name);
 }
 
+// ── Sync status dot ────────────────────────────────────────────────────────
+function updateSyncDot(lastSyncAt) {
+  const dot = document.getElementById('syncDot');
+  if (!lastSyncAt) {
+    dot.className = 'sync-dot';
+    dot.title = 'Not yet synced this session';
+    return;
+  }
+  const age = Date.now() - lastSyncAt;
+  const min = Math.round(age / 60000);
+  if (age < 10 * 60000) {
+    dot.className = 'sync-dot ok';
+    dot.title = 'Synced ' + (min < 1 ? 'just now' : min + 'm ago');
+  } else if (age < 60 * 60000) {
+    dot.className = 'sync-dot warn';
+    dot.title = 'Synced ' + min + 'm ago';
+  } else {
+    dot.className = 'sync-dot err';
+    dot.title = 'Last synced ' + Math.round(age / 3600000) + 'h ago — check Firefox Sync';
+  }
+}
+
+// ── Quota warning ──────────────────────────────────────────────────────────
+function updateQuotaWarn(quota) {
+  const el = document.getElementById('quotaWarn');
+  if (quota && quota.pct > 0.8) {
+    el.textContent = `Sync storage ${Math.round(quota.pct * 100)}% full`;
+    el.classList.add('visible');
+  } else {
+    el.classList.remove('visible');
+  }
+}
+
 // ── Initials ───────────────────────────────────────────────────────────────
 function initials(name) {
   const w = name.trim().split(/\s+/);
@@ -50,33 +84,27 @@ function renderList() {
 
   list.innerHTML = '';
   for (const ws of entries) {
-    const active   = ws.id === state.currentWorkspaceId;
-    const openInWins = Object.values(state.windowWorkspaceMap).filter(id => id === ws.id).length;
+    const active = ws.id === state.currentWorkspaceId;
 
     const row = document.createElement('div');
     row.className = 'ws-row' + (active ? ' active' : '');
     row.setAttribute('role', 'button');
     row.setAttribute('tabindex', '0');
-    // Used by CSS ::before to draw the left colour bar on active rows
     row.style.setProperty('--dot', ws.color);
 
-    // Dot
     const dot = document.createElement('div');
     dot.className = 'ws-dot';
     dot.style.background = ws.color;
     dot.textContent = initials(ws.name);
 
-    // Name
     const name = document.createElement('span');
     name.className = 'ws-name';
     name.textContent = ws.name;
 
-    // "Current" pill — only visible on active row
     const pill = document.createElement('span');
     pill.className = 'ws-pill' + (active ? '' : ' hidden');
     pill.textContent = 'current';
 
-    // Menu button
     const menuBtn = document.createElement('button');
     menuBtn.type = 'button';
     menuBtn.className = 'ws-menu';
@@ -127,8 +155,16 @@ function showDrop(anchor, ws) {
   menu.className = 'drop';
 
   const rows = [
-    { label: 'Edit',   cls: '',    icon: `<path d="M1 8.5V10h1.5l4.5-4.5-1.5-1.5L1 8.5zM9.2 2.3a.7.7 0 000-1L8.7.8a.7.7 0 00-1 0L7 1.5 8.5 3l.7-.7z" fill="currentColor"/>`, action: () => openForm('edit', ws) },
-    { label: 'Delete', cls: 'del', icon: `<path d="M.5 2.5h9M3 2.5V1.5h4v1M1.5 2.5l.7 7h5.6l.7-7" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>`, action: () => openDel(ws) },
+    {
+      label: 'Edit', cls: '',
+      icon: `<path d="M1 8.5V10h1.5l4.5-4.5-1.5-1.5L1 8.5zM9.2 2.3a.7.7 0 000-1L8.7.8a.7.7 0 00-1 0L7 1.5 8.5 3l.7-.7z" fill="currentColor"/>`,
+      action: () => openForm('edit', ws),
+    },
+    {
+      label: 'Delete', cls: 'del',
+      icon: `<path d="M.5 2.5h9M3 2.5V1.5h4v1M1.5 2.5l.7 7h5.6l.7-7" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>`,
+      action: () => openDel(ws),
+    },
   ];
 
   for (const r of rows) {
@@ -157,23 +193,42 @@ function buildSwatches(selectedColor) {
   container.innerHTML = '';
   formColor = selectedColor;
 
+  const picker = document.getElementById('colorPicker');
+  const wheel  = document.getElementById('colorWheelBtn');
+
+  let isPreset = false;
+
   for (const c of state.colors) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'sw' + (c.value === selectedColor ? ' sel' : '');
     btn.style.background = c.value;
     btn.title = c.name;
+    if (c.value === selectedColor) isPreset = true;
+
     btn.addEventListener('click', () => {
       container.querySelectorAll('.sw').forEach(s => s.classList.remove('sel'));
+      wheel.classList.remove('sel');
       btn.classList.add('sel');
       formColor = c.value;
+      picker.value = c.value;
     });
     container.appendChild(btn);
   }
+
+  // Set color picker to current color
+  picker.value = selectedColor;
+  wheel.classList.toggle('sel', !isPreset);
 }
 
+document.getElementById('colorPicker').addEventListener('input', e => {
+  document.getElementById('swatches').querySelectorAll('.sw').forEach(s => s.classList.remove('sel'));
+  document.getElementById('colorWheelBtn').classList.add('sel');
+  formColor = e.target.value;
+});
+
 function openForm(mode, ws, fromCurrent) {
-  formMode = mode;
+  formMode          = mode;
   formFromCurrent   = !!fromCurrent;
   formWorkspaceId   = ws ? ws.id    : null;
   formOriginalColor = ws ? ws.color : null;
@@ -181,8 +236,8 @@ function openForm(mode, ws, fromCurrent) {
   const isEdit = mode === 'edit';
   document.getElementById('formTitle').textContent =
     isEdit ? 'Edit workspace' : (formFromCurrent ? 'New from current tabs' : 'New blank workspace');
-  document.getElementById('btnFormOk').textContent  = isEdit ? 'Save' : 'Create';
-  document.getElementById('formErr').textContent    = '';
+  document.getElementById('btnFormOk').textContent = isEdit ? 'Save' : 'Create';
+  document.getElementById('formErr').textContent   = '';
 
   const existing = Object.values(state.workspaces).map(w => w.name);
   if (isEdit && ws) {
@@ -214,9 +269,8 @@ async function submitForm() {
         name,
         color: formColor || '#8764B8',
         fromCurrentWindow: formFromCurrent,
-        windowId: state.currentWindowId
+        windowId: state.currentWindowId,
       });
-      // Blank workspace: open it immediately in a new window (Edge behaviour)
       if (!formFromCurrent && result && result.workspace) {
         await send({ type: 'OPEN_WORKSPACE', workspaceId: result.workspace.id });
         window.close();
@@ -254,10 +308,57 @@ async function submitDel() {
     show('main');
     renderList();
   } catch (err) {
-    console.error(err);
+    console.error('[Workspaces] delete failed:', err);
   } finally {
     btn.disabled = false;
   }
+}
+
+// ── Export ─────────────────────────────────────────────────────────────────
+async function exportWorkspaces() {
+  try {
+    const result = await send({ type: 'EXPORT_WORKSPACES' });
+    if (!result || !result.data) return;
+    const json = JSON.stringify(result.data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `workspaces-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    console.error('[Workspaces] export failed:', err);
+  }
+}
+
+// ── Import ─────────────────────────────────────────────────────────────────
+function importWorkspaces() {
+  const input = document.createElement('input');
+  input.type   = 'file';
+  input.accept = '.json,application/json';
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const result = await send({ type: 'IMPORT_WORKSPACES', data, merge: true });
+      if (result && result.success) {
+        await loadState();
+        renderList();
+      } else {
+        console.error('[Workspaces] import failed:', result && result.error);
+      }
+    } catch (err) {
+      console.error('[Workspaces] import error:', err);
+    }
+  });
+  document.body.appendChild(input);
+  input.click();
+  document.body.removeChild(input);
 }
 
 // ── Load state ─────────────────────────────────────────────────────────────
@@ -268,14 +369,19 @@ async function loadState() {
   state.currentWindowId    = r.currentWindowId    || null;
   state.windowWorkspaceMap = r.windowWorkspaceMap  || {};
   state.colors             = r.colors             || [];
+  state.lastSyncAt         = r.lastSyncAt         || null;
+  state.quota              = r.quota              || null;
+
+  updateSyncDot(state.lastSyncAt);
+  updateQuotaWarn(state.quota);
 }
 
 // ── Event wiring ───────────────────────────────────────────────────────────
 document.getElementById('btnFromTabs').onclick = () => openForm('create', null, true);
 document.getElementById('btnBlank').onclick    = () => openForm('create', null, false);
 
-document.getElementById('btnBack').onclick       = () => { show('main'); };
-document.getElementById('btnFormCancel').onclick = () => { show('main'); };
+document.getElementById('btnBack').onclick       = () => show('main');
+document.getElementById('btnFormCancel').onclick = () => show('main');
 document.getElementById('btnFormOk').onclick     = submitForm;
 document.getElementById('fName').addEventListener('keydown', e => {
   if (e.key === 'Enter')  submitForm();
@@ -285,6 +391,9 @@ document.getElementById('fName').addEventListener('keydown', e => {
 
 document.getElementById('btnDelCancel').onclick = () => show('main');
 document.getElementById('btnDelOk').onclick     = submitDel;
+
+document.getElementById('btnExport').onclick = exportWorkspaces;
+document.getElementById('btnImport').onclick = importWorkspaces;
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 (async () => {
@@ -297,6 +406,5 @@ document.getElementById('btnDelOk').onclick     = submitDel;
     list.innerHTML = `<div class="empty">Failed to load.<br><small>${err.message}</small></div>`;
     show('main');
   }
-  // Reveal the popup only after content is ready — eliminates loading flash
   document.body.style.visibility = 'visible';
 })();

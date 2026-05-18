@@ -9,6 +9,8 @@
   --sub:     #666;
   --acc:     #8764B8;
   --red:     #c50f1f;
+  --grn:     #107C10;
+  --ylw:     #C19C00;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -21,7 +23,6 @@
   }
 }
 
-/* body is hidden until JS populates the list — prevents the Loading→content flash */
 body {
   visibility: hidden;
   background: var(--bg);
@@ -30,19 +31,15 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   font-size: 12px;
   color: var(--txt);
-  /* Fixed height stops Firefox resizing the popup window between views */
-  height: 220px;
+  height: 270px;
 }
 
-/* ---- Layout root ---- */
 .root {
   position: relative;
   width: 200px;
-  height: 220px;
+  height: 270px;
 }
 
-/* All views sit in the same space.
-   visibility toggle = no layout change = no flicker. */
 .v {
   position: absolute;
   inset: 0;
@@ -63,7 +60,7 @@ body {
   flex-shrink: 0;
 }
 .hdr-title { font-size: 11px; font-weight: 700; letter-spacing: .02em; }
-.hdr-nav { padding-left: 5px; }
+.hdr-nav   { padding-left: 5px; }
 
 .btn-back {
   width: 20px; height: 20px; flex-shrink: 0;
@@ -73,6 +70,32 @@ body {
 }
 .btn-back:hover { background: var(--row-h); }
 .btn-back svg { width: 14px; height: 14px; display: block; }
+
+/* ---- Sync dot ---- */
+.sync-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  margin-left: auto;
+  flex-shrink: 0;
+  background: var(--sep);
+}
+.sync-dot.ok   { background: var(--grn); }
+.sync-dot.warn { background: var(--ylw); }
+.sync-dot.err  { background: var(--red); }
+
+/* ---- Quota warning ---- */
+.quota-warn {
+  font-size: 9px;
+  color: var(--red);
+  padding: 0 10px;
+  height: 0;
+  overflow: hidden;
+  transition: height 0.1s;
+}
+.quota-warn.visible {
+  height: 16px;
+  padding: 2px 10px;
+}
 
 /* ---- Workspace list ---- */
 .ws-list {
@@ -90,7 +113,6 @@ body {
 }
 .ws-row:hover { background: var(--row-h); }
 
-/* Active workspace: left colour bar in the workspace's own colour */
 .ws-row.active { background: var(--row-act); }
 .ws-row.active .ws-name { font-weight: 600; }
 .ws-row.active::before {
@@ -109,7 +131,6 @@ body {
 }
 .ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 
-/* "current" pill shown on the active row */
 .ws-pill {
   font-size: 9px; font-weight: 700;
   color: var(--acc);
@@ -137,7 +158,7 @@ body {
   padding: 12px; text-align: center; line-height: 1.5;
 }
 
-/* ---- Footer row buttons ---- */
+/* ---- Footer buttons ---- */
 .btns {
   border-top: 1px solid var(--sep);
   display: flex; flex-direction: column;
@@ -153,6 +174,10 @@ body {
 }
 .btn-row:hover { background: var(--row-h); }
 .btn-row svg { width: 13px; height: 13px; flex-shrink: 0; opacity: .55; }
+
+/* Export / Import row */
+.btns-io { display: flex; gap: 1px; }
+.btn-io  { flex: 1; padding: 4px 6px; font-size: 10px; justify-content: center; }
 
 /* ---- Dropdown ---- */
 .drop {
@@ -189,7 +214,9 @@ body {
 }
 .inp:focus { border-color: var(--acc); }
 
-/* ---- Swatches ---- */
+/* ---- Color row (swatches + wheel) ---- */
+.color-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+
 .swatches { display: flex; flex-wrap: wrap; gap: 4px; }
 .sw {
   width: 18px; height: 18px; border-radius: 4px;
@@ -198,6 +225,27 @@ body {
 }
 .sw:hover { opacity: .8; }
 .sw.sel { border-color: var(--txt); }
+
+/* Color wheel button — conic gradient to indicate "custom" */
+.color-wheel {
+  background: conic-gradient(
+    hsl(0,85%,55%), hsl(40,85%,55%), hsl(80,85%,55%),
+    hsl(140,85%,40%), hsl(200,85%,55%), hsl(240,85%,60%),
+    hsl(280,85%,55%), hsl(320,85%,55%), hsl(360,85%,55%)
+  );
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+}
+.color-wheel #colorPicker {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+}
 
 /* ---- Form footer ---- */
 .btns-row { flex-direction: row; justify-content: flex-end; gap: 5px; padding: 6px 10px; }
@@ -216,5 +264,5 @@ body {
 
 /* ---- Delete confirm ---- */
 .del-body { justify-content: center; }
-.del-q   { font-size: 12px; line-height: 1.5; margin-bottom: 5px; }
-.del-sub { font-size: 11px; color: var(--sub); line-height: 1.4; }
+.del-q    { font-size: 12px; line-height: 1.5; margin-bottom: 5px; }
+.del-sub  { font-size: 11px; color: var(--sub); line-height: 1.4; }

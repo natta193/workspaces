@@ -1,17 +1,16 @@
 {
   "manifest_version": 2,
   "name": "Workspaces",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "description": "Edge-like workspaces for Firefox with automatic cross-device sync.",
   "author": "Firefox Workspaces",
-
   "permissions": [
     "tabs",
     "storage",
     "activeTab",
-    "theme"
+    "theme",
+    "alarms"
   ],
-
   "browser_action": {
     "default_popup": "popup/popup.html",
     "default_icon": {
@@ -22,17 +21,16 @@
     },
     "default_title": "Workspaces"
   },
-
   "background": {
-    "scripts": ["background.js"],
+    "scripts": [
+      "background.js"
+    ],
     "persistent": true
   },
-
   "icons": {
     "48": "icons/icon-48.svg",
     "96": "icons/icon-96.svg"
   },
-
   "browser_specific_settings": {
     "gecko": {
       "id": "firefox-workspaces@extension",

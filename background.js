@@ -4,6 +4,8 @@
 // Constants
 // ---------------------------------------------------------------------------
 
+const OPEN_URL_PREFIX = 'https://workspaces.firefox.ext/open/';
+
 const WORKSPACE_COLORS = [
   { name: 'Purple', value: '#8764B8' },
   { name: 'Blue',   value: '#0078D4' },
@@ -18,6 +20,10 @@ const WORKSPACE_COLORS = [
 
 const STORAGE_KEY_WORKSPACES = 'workspaces';
 const STORAGE_KEY_WINDOW_MAP  = 'windowWorkspaceMap';
+const STORAGE_KEY_LIVE_TABS   = 'workspaceLiveTabs';
+const STORAGE_KEY_LAST_SYNC   = 'lastSyncAt';
+
+const SYNC_QUOTA_BYTES = 102400;
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -29,7 +35,12 @@ async function getWorkspaces() {
 }
 
 async function saveWorkspaces(ws) {
+  const bytes = new TextEncoder().encode(JSON.stringify(ws)).length;
+  if (bytes > SYNC_QUOTA_BYTES * 0.85) {
+    console.warn(`[Workspaces] sync storage at ${Math.round(bytes / 1024)}KB / ${Math.round(SYNC_QUOTA_BYTES / 1024)}KB`);
+  }
   await browser.storage.sync.set({ [STORAGE_KEY_WORKSPACES]: ws });
+  await browser.storage.local.set({ [STORAGE_KEY_LAST_SYNC]: Date.now() });
 }
 
 async function getWindowMap() {
@@ -39,6 +50,17 @@ async function getWindowMap() {
 
 async function saveWindowMap(map) {
   await browser.storage.local.set({ [STORAGE_KEY_WINDOW_MAP]: map });
+}
+
+async function getLiveTabs() {
+  const data = await browser.storage.local.get(STORAGE_KEY_LIVE_TABS);
+  return data[STORAGE_KEY_LIVE_TABS] || {};
+}
+
+async function getQuotaInfo() {
+  const ws = await getWorkspaces();
+  const bytes = new TextEncoder().encode(JSON.stringify(ws)).length;
+  return { bytes, total: SYNC_QUOTA_BYTES, pct: bytes / SYNC_QUOTA_BYTES };
 }
 
 // ---------------------------------------------------------------------------
@@ -100,18 +122,22 @@ async function updateWindowIcon(windowId, color, name) {
   try {
     await browser.browserAction.setIcon({ imageData: buildIconImageData(color), windowId });
     await browser.browserAction.setTitle({ title: `Workspaces – ${name}`, windowId });
-  } catch (_) {}
+  } catch (err) {
+    console.warn('[Workspaces] updateWindowIcon failed:', err.message);
+  }
 }
 
 async function resetWindowIcon(windowId) {
   try {
     await browser.browserAction.setIcon({ imageData: buildIconImageData('#9B9B9B'), windowId });
     await browser.browserAction.setTitle({ title: 'Workspaces', windowId });
-  } catch (_) {}
+  } catch (err) {
+    console.warn('[Workspaces] resetWindowIcon failed:', err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Window frame theme (title bar colour)
+// Window frame theme
 // ---------------------------------------------------------------------------
 
 async function applyWindowTheme(windowId, color) {
@@ -119,18 +145,24 @@ async function applyWindowTheme(windowId, color) {
   try {
     await browser.theme.update(windowId, {
       colors: {
-        frame:                color,
-        frame_inactive:       color,
-        tab_background_text:  text,
-        bookmark_text:        text,
-        icons:                text,
+        frame:               color,
+        frame_inactive:      color,
+        tab_background_text: text,
+        bookmark_text:       text,
+        icons:               text,
       }
     });
-  } catch (_) {}
+  } catch (err) {
+    console.warn('[Workspaces] applyWindowTheme failed:', err.message);
+  }
 }
 
 async function resetWindowTheme(windowId) {
-  try { await browser.theme.reset(windowId); } catch (_) {}
+  try {
+    await browser.theme.reset(windowId);
+  } catch (err) {
+    console.warn('[Workspaces] resetWindowTheme failed:', err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +171,8 @@ async function resetWindowTheme(windowId) {
 
 async function refreshAllWindows() {
   const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
-  const windows   = await browser.windows.getAll({ windowTypes: ['normal'] });
-  const validIds  = new Set(windows.map(w => String(w.id)));
+  const windows  = await browser.windows.getAll({ windowTypes: ['normal'] });
+  const validIds = new Set(windows.map(w => String(w.id)));
 
   for (const win of windows) {
     const wsId = map[String(win.id)];
@@ -150,7 +182,6 @@ async function refreshAllWindows() {
     }
   }
 
-  // Purge stale window map entries
   let dirty = false;
   for (const winIdStr of Object.keys(map)) {
     if (!validIds.has(winIdStr)) { delete map[winIdStr]; dirty = true; }
@@ -164,6 +195,7 @@ async function refreshAllWindows() {
 
 function isRestorableUrl(url) {
   if (!url) return false;
+  if (url.startsWith(OPEN_URL_PREFIX)) return false;
   if (url === 'about:blank' || url === 'about:newtab' || url === 'about:home') return false;
   if (url.startsWith('moz-extension://') || url.startsWith('chrome-extension://')) return false;
   if (url.startsWith('about:') && !url.startsWith('about:reader')) return false;
@@ -181,16 +213,22 @@ async function createWorkspace(name, color, tabs) {
     id, name, color,
     tabs: (tabs || []).filter(t => isRestorableUrl(t.url)),
     createdAt: Date.now(),
-    lastUsed:  Date.now()
+    lastUsed:  Date.now(),
   };
   await saveWorkspaces(workspaces);
   return workspaces[id];
 }
 
 async function deleteWorkspace(workspaceId) {
-  const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
+  const [workspaces, map, live] = await Promise.all([
+    getWorkspaces(), getWindowMap(), getLiveTabs(),
+  ]);
   delete workspaces[workspaceId];
-  await saveWorkspaces(workspaces);
+  delete live[workspaceId];
+  await Promise.all([
+    saveWorkspaces(workspaces),
+    browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: live }),
+  ]);
 
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
@@ -226,7 +264,7 @@ async function recolorWorkspace(workspaceId, color) {
 }
 
 // ---------------------------------------------------------------------------
-// Assign a window to a workspace
+// Assign a window to a workspace (enforces single-window-per-workspace)
 // ---------------------------------------------------------------------------
 
 async function assignWindowToWorkspace(windowId, workspaceId) {
@@ -234,7 +272,6 @@ async function assignWindowToWorkspace(windowId, workspaceId) {
   const workspace = workspaces[workspaceId];
   if (!workspace) return;
 
-  // If this workspace was open in another window, remove that link and reset that window's chrome
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId && parseInt(winIdStr) !== windowId) {
       delete map[winIdStr];
@@ -254,27 +291,45 @@ async function assignWindowToWorkspace(windowId, workspaceId) {
 }
 
 // ---------------------------------------------------------------------------
-// Tab snapshot — called while tabs still exist
+// Tab snapshot
+// Live changes → local storage only (debounced, avoids hammering sync)
+// Window closing → local + sync (immediate, ensures data is persisted)
 // ---------------------------------------------------------------------------
 
 const _tabSaveTimers = {};
+const _closingWindowsSnapshotted = new Set();
 
 function scheduleTabSave(windowId) {
   clearTimeout(_tabSaveTimers[windowId]);
   _tabSaveTimers[windowId] = setTimeout(async () => {
     delete _tabSaveTimers[windowId];
-    await snapshotWindowTabs(windowId);
+    await snapshotToLocal(windowId);
   }, 600);
 }
 
-async function snapshotWindowTabs(windowId) {
-  // Query tabs FIRST before any storage reads — when a window is closing,
-  // tab-removed events fire in rapid succession. Any await before tabs.query
-  // yields to the event loop and lets more tabs disappear before we capture them.
+async function snapshotToLocal(windowId) {
   let tabs;
   try { tabs = await browser.tabs.query({ windowId }); }
-  catch (_) { return; }
-  if (!tabs.length) return; // window already fully closed — don't wipe saved tabs
+  catch (err) { console.warn('[Workspaces] tabs.query failed:', err.message); return; }
+  if (!tabs.length) return;
+
+  const map = await getWindowMap();
+  const workspaceId = map[String(windowId)];
+  if (!workspaceId) return;
+
+  const live = await getLiveTabs();
+  live[workspaceId] = tabs
+    .map(t => ({ url: t.url, title: t.title || t.url, pinned: t.pinned }))
+    .filter(t => isRestorableUrl(t.url));
+  await browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: live });
+}
+
+async function snapshotAndFlushToSync(windowId) {
+  // Query tabs FIRST before any awaits — tabs disappear fast when closing
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); }
+  catch (err) { console.warn('[Workspaces] tabs.query failed:', err.message); return; }
+  if (!tabs.length) return;
 
   const map = await getWindowMap();
   const workspaceId = map[String(windowId)];
@@ -284,18 +339,26 @@ async function snapshotWindowTabs(windowId) {
   const workspace  = workspaces[workspaceId];
   if (!workspace) return;
 
-  workspace.tabs = tabs
+  const snappedTabs = tabs
     .map(t => ({ url: t.url, title: t.title || t.url, pinned: t.pinned }))
     .filter(t => isRestorableUrl(t.url));
+
+  workspace.tabs    = snappedTabs;
   workspace.lastUsed = Date.now();
-  await saveWorkspaces(workspaces);
+
+  const live = await getLiveTabs();
+  live[workspaceId] = snappedTabs;
+
+  await Promise.all([
+    saveWorkspaces(workspaces),
+    browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: live }),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
 // Open a workspace in a window
 // ---------------------------------------------------------------------------
 
-// Flag so windows.onCreated knows not to auto-assign extension-opened windows
 let _extensionIsCreatingWindow = false;
 
 async function openWorkspace(workspaceId) {
@@ -303,13 +366,14 @@ async function openWorkspace(workspaceId) {
   const workspace = workspaces[workspaceId];
   if (!workspace) return { error: 'Workspace not found' };
 
-  // Already open → focus it
+  // Already open in a window → focus it (enforces single-window-per-workspace)
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
       try {
         await browser.windows.update(parseInt(winIdStr), { focused: true });
         return { success: true };
-      } catch (_) {
+      } catch (err) {
+        console.warn('[Workspaces] Could not focus existing window:', err.message);
         delete map[winIdStr];
         await saveWindowMap(map);
         break;
@@ -317,25 +381,30 @@ async function openWorkspace(workspaceId) {
     }
   }
 
-  const restorableUrls = workspace.tabs.map(t => t.url).filter(isRestorableUrl);
-  // Omit url entirely when empty — Firefox opens its default new-tab page.
-  // Never pass about:newtab — Firefox blocks privileged about: URLs from extensions.
+  // Prefer live (in-progress) tabs, fall back to last-saved sync tabs
+  const live = await getLiveTabs();
+  const tabs = live[workspaceId] || workspace.tabs || [];
+  const restorableUrls = tabs.map(t => t.url).filter(isRestorableUrl);
   const createOpts = restorableUrls.length > 0 ? { url: restorableUrls } : {};
 
   _extensionIsCreatingWindow = true;
   let win;
   try {
     win = await browser.windows.create(createOpts);
+  } catch (err) {
+    console.error('[Workspaces] Failed to create window:', err.message);
+    return { error: err.message };
   } finally {
     _extensionIsCreatingWindow = false;
   }
 
-  // Restore pinned tabs
-  if (workspace.tabs.some(t => t.pinned)) {
+  if (tabs.some(t => t.pinned)) {
     const opened = await browser.tabs.query({ windowId: win.id });
     for (let i = 0; i < opened.length; i++) {
-      if (workspace.tabs[i]?.pinned) {
-        await browser.tabs.update(opened[i].id, { pinned: true }).catch(() => {});
+      if (tabs[i]?.pinned) {
+        await browser.tabs.update(opened[i].id, { pinned: true }).catch(
+          err => console.warn('[Workspaces] pin failed:', err.message)
+        );
       }
     }
   }
@@ -352,6 +421,26 @@ async function openWorkspace(workspaceId) {
   return { success: true, windowId: win.id };
 }
 
+async function openWorkspaceByName(name) {
+  const workspaces = await getWorkspaces();
+  const ws = Object.values(workspaces).find(w => w.name === name);
+  if (ws) return openWorkspace(ws.id);
+  console.warn('[Workspaces] No workspace named:', name);
+  return { error: 'Not found: ' + name };
+}
+
+// ---------------------------------------------------------------------------
+// URL interception — allows CLI script / school.sh to open a workspace
+// URL format: https://workspaces.firefox.ext/open/<encoded-name>
+// ---------------------------------------------------------------------------
+
+async function handleWorkspaceOpenUrl(tabId, url) {
+  if (!url.startsWith(OPEN_URL_PREFIX)) return;
+  const name = decodeURIComponent(url.slice(OPEN_URL_PREFIX.length));
+  browser.tabs.remove(tabId).catch(() => {});
+  await openWorkspaceByName(name);
+}
+
 // ---------------------------------------------------------------------------
 // Tab event listeners
 // ---------------------------------------------------------------------------
@@ -360,33 +449,32 @@ browser.tabs.onCreated.addListener(tab => {
   if (tab.windowId) scheduleTabSave(tab.windowId);
 });
 
-// KEY FIX: snapshot tabs while they still exist (isWindowClosing = tabs are mid-removal,
-// remaining tabs are still queryable). Do NOT snapshot in windows.onRemoved — by then
-// tabs.query returns empty, which would wipe the saved tab list.
-const _closingWindowsSnapshotted = new Set();
-
 browser.tabs.onRemoved.addListener((tabId, info) => {
   if (info.isWindowClosing) {
     if (!_closingWindowsSnapshotted.has(info.windowId)) {
       _closingWindowsSnapshotted.add(info.windowId);
-      // Cancel any pending debounced save so it doesn't race with our snapshot
       clearTimeout(_tabSaveTimers[info.windowId]);
       delete _tabSaveTimers[info.windowId];
-      // Snapshot NOW — the other tabs are still alive at this point
-      snapshotWindowTabs(info.windowId);
+      snapshotAndFlushToSync(info.windowId);
     }
   } else {
     scheduleTabSave(info.windowId);
   }
 });
 
-browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.url !== undefined || changeInfo.title !== undefined) {
+browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.url) {
+    if (changeInfo.url.startsWith(OPEN_URL_PREFIX)) {
+      await handleWorkspaceOpenUrl(tabId, changeInfo.url);
+      return;
+    }
+    scheduleTabSave(tab.windowId);
+  } else if (changeInfo.title !== undefined) {
     scheduleTabSave(tab.windowId);
   }
 });
 
-browser.tabs.onMoved.addListener((tabId, info) => { scheduleTabSave(info.windowId); });
+browser.tabs.onMoved.addListener((tabId, info)   => { scheduleTabSave(info.windowId); });
 browser.tabs.onDetached.addListener((tabId, info) => { scheduleTabSave(info.oldWindowId); });
 browser.tabs.onAttached.addListener((tabId, info) => { scheduleTabSave(info.newWindowId); });
 
@@ -394,28 +482,14 @@ browser.tabs.onAttached.addListener((tabId, info) => { scheduleTabSave(info.newW
 // Window event listeners
 // ---------------------------------------------------------------------------
 
-// New window opened by the user (not by our extension) → auto-assign to a workspace
-browser.windows.onCreated.addListener(async win => {
+// New windows opened by the user get no automatic workspace assignment.
+// The user opens workspaces explicitly via the popup or the CLI script.
+browser.windows.onCreated.addListener(win => {
   if (win.type !== 'normal' || _extensionIsCreatingWindow) return;
-
-  const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
-  const entries = Object.values(workspaces);
-  if (!entries.length) return;
-
-  // Find workspaces not currently open in any window, sorted by lastUsed desc
-  const openWsIds = new Set(Object.values(map));
-  const candidates = entries
-    .filter(ws => !openWsIds.has(ws.id))
-    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
-
-  if (!candidates.length) return; // all workspaces are already in windows — leave unassigned
-
-  await assignWindowToWorkspace(win.id, candidates[0].id);
+  // intentionally no auto-assignment
 });
 
 browser.windows.onRemoved.addListener(async windowId => {
-  // Cancel any pending debounced save — the window is gone, tabs.query returns empty.
-  // The actual tab snapshot was taken in tabs.onRemoved (isWindowClosing) above.
   clearTimeout(_tabSaveTimers[windowId]);
   delete _tabSaveTimers[windowId];
   _closingWindowsSnapshotted.delete(windowId);
@@ -441,6 +515,18 @@ browser.windows.onFocusChanged.addListener(async windowId => {
 
 browser.storage.onChanged.addListener(async (changes, area) => {
   if (area === 'sync' && changes[STORAGE_KEY_WORKSPACES]) {
+    await browser.storage.local.set({ [STORAGE_KEY_LAST_SYNC]: Date.now() });
+    await refreshAllWindows();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Periodic alarm — fallback for missed onChanged events (e.g. browser was
+// closed when the other device synced)
+// ---------------------------------------------------------------------------
+
+browser.alarms.onAlarm.addListener(async alarm => {
+  if (alarm.name === 'ws-sync-check') {
     await refreshAllWindows();
   }
 });
@@ -453,16 +539,27 @@ browser.runtime.onMessage.addListener(async message => {
   switch (message.type) {
 
     case 'GET_STATE': {
-      const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
+      const [workspaces, map, localData, quota] = await Promise.all([
+        getWorkspaces(),
+        getWindowMap(),
+        browser.storage.local.get(STORAGE_KEY_LAST_SYNC),
+        getQuotaInfo(),
+      ]);
       let currentWindowId = null;
       try {
-        // getLastFocused({windowTypes:['normal']}) returns the most recently focused
-        // normal window — reliable even when the popup overlay is active.
         const win = await browser.windows.getLastFocused({ windowTypes: ['normal'] });
         if (win && win.id !== browser.windows.WINDOW_ID_NONE) currentWindowId = win.id;
-      } catch (_) {}
+      } catch (err) {
+        console.warn('[Workspaces] getLastFocused failed:', err.message);
+      }
       const currentWorkspaceId = currentWindowId ? (map[String(currentWindowId)] || null) : null;
-      return { workspaces, currentWorkspaceId, currentWindowId, windowWorkspaceMap: map, colors: WORKSPACE_COLORS };
+      return {
+        workspaces, currentWorkspaceId, currentWindowId,
+        windowWorkspaceMap: map,
+        colors: WORKSPACE_COLORS,
+        lastSyncAt: localData[STORAGE_KEY_LAST_SYNC] || null,
+        quota,
+      };
     }
 
     case 'CREATE_WORKSPACE': {
@@ -481,7 +578,8 @@ browser.runtime.onMessage.addListener(async message => {
       return { workspace };
     }
 
-    case 'OPEN_WORKSPACE':  return openWorkspace(message.workspaceId);
+    case 'OPEN_WORKSPACE':
+      return openWorkspace(message.workspaceId);
 
     case 'DELETE_WORKSPACE':
       await deleteWorkspace(message.workspaceId);
@@ -498,6 +596,36 @@ browser.runtime.onMessage.addListener(async message => {
     case 'GET_COLORS':
       return { colors: WORKSPACE_COLORS };
 
+    case 'EXPORT_WORKSPACES': {
+      const [workspaces, live] = await Promise.all([getWorkspaces(), getLiveTabs()]);
+      const out = JSON.parse(JSON.stringify(workspaces));
+      for (const [wsId, tabs] of Object.entries(live)) {
+        if (out[wsId]) out[wsId].tabs = tabs;
+      }
+      return { data: out };
+    }
+
+    case 'IMPORT_WORKSPACES': {
+      const { data, merge } = message;
+      if (!data || typeof data !== 'object') return { error: 'Invalid data' };
+      const existing = merge ? await getWorkspaces() : {};
+      let count = 0;
+      for (const [id, ws] of Object.entries(data)) {
+        if (!ws.id || !ws.name || !ws.color) continue;
+        existing[id] = {
+          id: ws.id,
+          name: String(ws.name),
+          color: String(ws.color),
+          tabs: Array.isArray(ws.tabs) ? ws.tabs : [],
+          createdAt: ws.createdAt || Date.now(),
+          lastUsed:  ws.lastUsed  || Date.now(),
+        };
+        count++;
+      }
+      await saveWorkspaces(existing);
+      return { success: true, count };
+    }
+
     default:
       return { error: 'Unknown message type: ' + message.type };
   }
@@ -508,6 +636,22 @@ browser.runtime.onMessage.addListener(async message => {
 // ---------------------------------------------------------------------------
 
 async function init() {
+  // Flush any live tabs left over from a previous crash into sync
+  try {
+    const [live, workspaces] = await Promise.all([getLiveTabs(), getWorkspaces()]);
+    if (Object.keys(live).length) {
+      let changed = false;
+      for (const [wsId, tabs] of Object.entries(live)) {
+        if (workspaces[wsId]) { workspaces[wsId].tabs = tabs; changed = true; }
+      }
+      if (changed) await saveWorkspaces(workspaces);
+      await browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: {} });
+    }
+  } catch (err) {
+    console.warn('[Workspaces] crash-recovery flush failed:', err.message);
+  }
+
+  // Clean up stale window map entries
   const [map, windows] = await Promise.all([getWindowMap(), browser.windows.getAll({ windowTypes: ['normal'] })]);
   const validIds = new Set(windows.map(w => String(w.id)));
   let dirty = false;
@@ -518,22 +662,20 @@ async function init() {
 
   await refreshAllWindows();
 
-  // Auto-assign any open windows that have no workspace
-  const [workspaces, currentMap] = await Promise.all([getWorkspaces(), getWindowMap()]);
-  const entries    = Object.values(workspaces);
-  const openWsIds  = new Set(Object.values(currentMap));
-
-  for (const win of windows) {
-    if (!currentMap[String(win.id)] && entries.length) {
-      const candidates = entries
-        .filter(ws => !openWsIds.has(ws.id))
-        .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
-      if (candidates.length) {
-        await assignWindowToWorkspace(win.id, candidates[0].id);
-        openWsIds.add(candidates[0].id);
+  // Handle any workspace-open URLs already loaded (e.g. Firefox started via open-workspace.sh)
+  try {
+    const allTabs = await browser.tabs.query({});
+    for (const tab of allTabs) {
+      if (tab.url && tab.url.startsWith(OPEN_URL_PREFIX)) {
+        await handleWorkspaceOpenUrl(tab.id, tab.url);
       }
     }
+  } catch (err) {
+    console.warn('[Workspaces] startup URL scan failed:', err.message);
   }
+
+  // Periodic alarm — re-checks sync every 2 minutes as a fallback
+  await browser.alarms.create('ws-sync-check', { periodInMinutes: 2 });
 }
 
 init().catch(err => console.error('[Workspaces] init error:', err));
