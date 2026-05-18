@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Workspaces</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<!-- body starts invisible; JS makes it visible once content is ready -->
+<body>
+<div class="root">
+
+  <div id="vMain" class="v on">
+    <div class="hdr"><span class="hdr-title">Workspaces</span></div>
+    <div class="ws-list" id="wsList"></div>
+    <div class="btns">
+      <button class="btn-row" id="btnFromTabs">
+        <svg viewBox="0 0 14 14" fill="none"><rect x="1" y="2" width="7" height="6" rx=".9" stroke="currentColor" stroke-width="1.2"/><rect x="6" y="6" width="7" height="6" rx=".9" stroke="currentColor" stroke-width="1.2"/><path d="M11 2.5v3M9.5 4h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        New from current tabs
+      </button>
+      <button class="btn-row" id="btnBlank">
+        <svg viewBox="0 0 14 14" fill="none"><rect x="1" y="2" width="7" height="6" rx=".9" stroke="currentColor" stroke-width="1.2"/><rect x="6" y="6" width="7" height="6" rx=".9" stroke="currentColor" stroke-width="1.2"/><path d="M9.5 8.5v3M8 10h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        New blank workspace
+      </button>
+    </div>
+  </div>
+
+  <div id="vForm" class="v">
+    <div class="hdr hdr-nav">
+      <button class="btn-back" id="btnBack">
+        <svg viewBox="0 0 14 14" fill="none"><path d="M9 3L5 7l4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <span class="hdr-title" id="formTitle">New workspace</span>
+    </div>
+    <div class="form">
+      <label class="lbl" for="fName">Name</label>
+      <input id="fName" class="inp" type="text" placeholder="Workspace name" maxlength="60" autocomplete="off" spellcheck="false"/>
+      <label class="lbl">Color</label>
+      <div class="swatches" id="swatches"></div>
+      <div class="form-err" id="formErr"></div>
+    </div>
+    <div class="btns btns-row">
+      <button class="btn-cancel" id="btnFormCancel">Cancel</button>
+      <button class="btn-ok" id="btnFormOk">Create</button>
+    </div>
+  </div>
+
+  <div id="vDel" class="v">
+    <div class="hdr"><span class="hdr-title">Delete workspace</span></div>
+    <div class="form del-body">
+      <p class="del-q">Delete <strong id="delName"></strong>?</p>
+      <p class="del-sub">Saved tabs in this workspace will be lost.</p>
+    </div>
+    <div class="btns btns-row">
+      <button class="btn-cancel" id="btnDelCancel">Cancel</button>
+      <button class="btn-danger" id="btnDelOk">Delete</button>
+    </div>
+  </div>
+
+</div>
+<script src="popup.js"></script>
+</body>
+</html>
