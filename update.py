@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-update.py — bump version, re-sign, and optionally push to git.
+update.py — bump version, re-sign, commit, push, and create a GitHub release.
 
 Usage:
-    python update.py              # bump patch version + sign
-    python update.py --no-bump   # sign without changing version
-    python update.py --push      # sign + commit + git push
+    python update.py              # bump patch + sign + commit + push + release
+    python update.py --no-bump    # sign without changing version
+    python update.py --no-push    # skip commit/push
+    python update.py --no-release # skip GitHub release
 """
 
 import argparse
@@ -47,12 +48,35 @@ def bump_patch(manifest_path: Path) -> tuple[str, str]:
     return old, manifest['version']
 
 
+# ── GitHub release ────────────────────────────────────────────────────────────
+
+def create_github_release(version: str, xpi: Path):
+    tag = version
+    print(f"\nCreating GitHub release {tag}…")
+
+    result = subprocess.run(
+        [
+            'gh', 'release', 'create', tag,
+            str(xpi),
+            '--title', tag,
+            '--notes', f'Firefox Workspaces {tag}',
+        ],
+        cwd=ROOT,
+    )
+
+    if result.returncode != 0:
+        print("GitHub release failed (is 'gh' authenticated? run: gh auth login)")
+    else:
+        print(f"Release {tag} created with {xpi.name}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description='Re-sign the Firefox extension.')
-    parser.add_argument('--no-bump', action='store_true', help='Skip version bump')
-    parser.add_argument('--push',    action='store_true', help='Commit and git push after signing')
+    parser.add_argument('--no-bump',    action='store_true', help='Skip version bump')
+    parser.add_argument('--no-push',    action='store_true', help='Skip commit and push')
+    parser.add_argument('--no-release', action='store_true', help='Skip GitHub release')
     args = parser.parse_args()
 
     env = load_env(ROOT / '.env')
@@ -94,20 +118,29 @@ def main():
         print("\nSigning failed.")
         sys.exit(result.returncode)
 
-    xpis = list(artifacts_dir.glob('*.xpi'))
-    print(f"\nSigned: {xpis[-1].name}" if xpis else "\nSigned successfully.")
+    xpis = sorted(artifacts_dir.glob('*.xpi'), key=lambda p: p.stat().st_mtime)
+    if not xpis:
+        print("\nSigned successfully (XPI not found locally).")
+        sys.exit(0)
+
+    xpi = xpis[-1]
+    print(f"\nSigned: {xpi.name}")
     print("Install via: about:addons → ⚙ → Install Add-on From File")
 
     # Git commit + push
-    if args.push:
+    if not args.no_push:
         print("\nCommitting and pushing…")
         subprocess.run(['git', 'add', 'manifest.json'], cwd=ROOT, check=True)
         subprocess.run(
-            ['git', 'commit', '-m', f'chore: bump version to {version}'],
+            ['git', 'commit', '-m', f'bump to {version}'],
             cwd=ROOT, check=True,
         )
-        subprocess.run(['git', 'push'], cwd=ROOT, check=True)
+        subprocess.run(['git', 'push', 'origin', 'main'], cwd=ROOT, check=True)
         print("Pushed.")
+
+    # GitHub release
+    if not args.no_release:
+        create_github_release(version, xpi)
 
 
 if __name__ == '__main__':

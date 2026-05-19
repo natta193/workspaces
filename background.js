@@ -434,8 +434,14 @@ async function openWorkspaceByName(name) {
 // URL format: https://workspaces.firefox.ext/open/<encoded-name>
 // ---------------------------------------------------------------------------
 
+// Guards against tabs.onUpdated and init()'s URL scan both firing at startup,
+// which would call openWorkspace twice before the window map is updated.
+const _handledOpenTabs = new Set();
+
 async function handleWorkspaceOpenUrl(tabId, url) {
   if (!url.startsWith(OPEN_URL_PREFIX)) return;
+  if (_handledOpenTabs.has(tabId)) return;
+  _handledOpenTabs.add(tabId);
   const name = decodeURIComponent(url.slice(OPEN_URL_PREFIX.length));
   browser.tabs.remove(tabId).catch(() => {});
   await openWorkspaceByName(name);
