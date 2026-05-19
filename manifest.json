@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Workspaces",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Edge-like workspaces for Firefox with automatic cross-device sync.",
   "author": "Firefox Workspaces",
   "permissions": [

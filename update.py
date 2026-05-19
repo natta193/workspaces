@@ -130,7 +130,7 @@ def main():
     # Git commit + push
     if not args.no_push:
         print("\nCommitting and pushing…")
-        subprocess.run(['git', 'add', 'manifest.json'], cwd=ROOT, check=True)
+        subprocess.run(['git', 'add', '.'], cwd=ROOT, check=True)
         subprocess.run(
             ['git', 'commit', '-m', f'bump to {version}'],
             cwd=ROOT, check=True,
