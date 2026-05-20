@@ -234,6 +234,7 @@ async function deleteWorkspace(workspaceId) {
     if (wsId === workspaceId) {
       const winId = parseInt(winIdStr);
       delete map[winIdStr];
+      await unmarkWindowAsWorkspace(winId);
       await resetWindowIcon(winId);
       await resetWindowTheme(winId);
     }
@@ -264,6 +265,27 @@ async function recolorWorkspace(workspaceId, color) {
 }
 
 // ---------------------------------------------------------------------------
+// Sessions API — marks workspace windows so Firefox session restore can be
+// detected and suppressed on next startup
+// ---------------------------------------------------------------------------
+
+async function markWindowAsWorkspace(windowId, workspaceId) {
+  try {
+    await browser.sessions.setWindowValue(windowId, 'workspaceId', workspaceId);
+  } catch (err) {
+    console.warn('[Workspaces] setWindowValue failed:', err.message);
+  }
+}
+
+async function unmarkWindowAsWorkspace(windowId) {
+  try {
+    await browser.sessions.removeWindowValue(windowId, 'workspaceId');
+  } catch (err) {
+    console.warn('[Workspaces] removeWindowValue failed:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Assign a window to a workspace (enforces single-window-per-workspace)
 // ---------------------------------------------------------------------------
 
@@ -274,14 +296,17 @@ async function assignWindowToWorkspace(windowId, workspaceId) {
 
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId && parseInt(winIdStr) !== windowId) {
+      const oldWinId = parseInt(winIdStr);
       delete map[winIdStr];
-      await resetWindowIcon(parseInt(winIdStr));
-      await resetWindowTheme(parseInt(winIdStr));
+      await unmarkWindowAsWorkspace(oldWinId);
+      await resetWindowIcon(oldWinId);
+      await resetWindowTheme(oldWinId);
     }
   }
 
   map[String(windowId)] = workspaceId;
   await saveWindowMap(map);
+  await markWindowAsWorkspace(windowId, workspaceId);
 
   await updateWindowIcon(windowId, workspace.color, workspace.name);
   await applyWindowTheme(windowId, workspace.color);
@@ -411,6 +436,7 @@ async function openWorkspace(workspaceId) {
 
   map[String(win.id)] = workspaceId;
   await saveWindowMap(map);
+  await markWindowAsWorkspace(win.id, workspaceId);
 
   workspace.lastUsed = Date.now();
   await saveWorkspaces(workspaces);
@@ -655,6 +681,22 @@ async function init() {
     }
   } catch (err) {
     console.warn('[Workspaces] crash-recovery flush failed:', err.message);
+  }
+
+  // Close any windows that Firefox restored from a previous workspace session.
+  // These would appear as plain unassigned windows containing workspace tabs,
+  // which is confusing. Workspace sessions are marked via browser.sessions so
+  // we can reliably detect and suppress them here.
+  try {
+    const allWins = await browser.windows.getAll({ windowTypes: ['normal'] });
+    for (const win of allWins) {
+      const wsId = await browser.sessions.getWindowValue(win.id, 'workspaceId').catch(() => null);
+      if (wsId) {
+        await browser.windows.remove(win.id).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn('[Workspaces] restored-session cleanup failed:', err.message);
   }
 
   // Clean up stale window map entries
