@@ -394,11 +394,16 @@ async function openWorkspace(workspaceId) {
   // Already open in a window → focus it (enforces single-window-per-workspace)
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
+      const winId = parseInt(winIdStr);
       try {
-        const existingWin = await browser.windows.get(parseInt(winIdStr));
+        // Confirm the window still belongs to this workspace — Firefox reuses
+        // window IDs, so a stale map entry can silently point to a different window.
+        const sessionWsId = await browser.sessions.getWindowValue(winId, 'workspaceId').catch(() => null);
+        if (sessionWsId !== workspaceId) throw new Error('stale map entry');
+        const existingWin = await browser.windows.get(winId);
         const updateOpts = { focused: true };
         if (existingWin.state === 'minimized') updateOpts.state = 'normal';
-        await browser.windows.update(parseInt(winIdStr), updateOpts);
+        await browser.windows.update(winId, updateOpts);
         return { success: true };
       } catch (err) {
         console.warn('[Workspaces] Could not focus existing window:', err.message);
