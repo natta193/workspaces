@@ -395,7 +395,10 @@ async function openWorkspace(workspaceId) {
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
       try {
-        await browser.windows.update(parseInt(winIdStr), { focused: true });
+        const existingWin = await browser.windows.get(parseInt(winIdStr));
+        const updateOpts = { focused: true };
+        if (existingWin.state === 'minimized') updateOpts.state = 'normal';
+        await browser.windows.update(parseInt(winIdStr), updateOpts);
         return { success: true };
       } catch (err) {
         console.warn('[Workspaces] Could not focus existing window:', err.message);
@@ -410,7 +413,7 @@ async function openWorkspace(workspaceId) {
   const live = await getLiveTabs();
   const tabs = live[workspaceId] || workspace.tabs || [];
   const restorableUrls = tabs.map(t => t.url).filter(isRestorableUrl);
-  const createOpts = restorableUrls.length > 0 ? { url: restorableUrls } : {};
+  const createOpts = restorableUrls.length > 0 ? { url: restorableUrls, focused: true } : { focused: true };
 
   _extensionIsCreatingWindow = true;
   let win;
