@@ -199,6 +199,7 @@ function isRestorableUrl(url) {
   if (url === 'about:blank' || url === 'about:newtab' || url === 'about:home') return false;
   if (url.startsWith('moz-extension://') || url.startsWith('chrome-extension://')) return false;
   if (url.startsWith('about:') && !url.startsWith('about:reader')) return false;
+  if (url.startsWith('file://') || url.startsWith('blob:') || url.startsWith('data:')) return false;
   return true;
 }
 
