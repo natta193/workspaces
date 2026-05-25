@@ -23,6 +23,9 @@ const STORAGE_KEY_WINDOW_MAP  = 'windowWorkspaceMap';
 const STORAGE_KEY_LIVE_TABS   = 'workspaceLiveTabs';
 const STORAGE_KEY_LAST_SYNC   = 'lastSyncAt';
 
+// In-memory cache: windowId → { color, name } — kept in sync by updateWindowIcon/resetWindowIcon.
+const _windowMeta = {};
+
 const SYNC_QUOTA_BYTES = 102400;
 
 // ---------------------------------------------------------------------------
@@ -119,6 +122,7 @@ function buildIconImageData(color) {
 }
 
 async function updateWindowIcon(windowId, color, name) {
+  _windowMeta[windowId] = { color, name };
   try {
     await browser.browserAction.setIcon({ imageData: buildIconImageData(color), windowId });
     await browser.browserAction.setTitle({ title: `Workspaces – ${name}`, windowId });
@@ -128,6 +132,7 @@ async function updateWindowIcon(windowId, color, name) {
 }
 
 async function resetWindowIcon(windowId) {
+  delete _windowMeta[windowId];
   try {
     await browser.browserAction.setIcon({ imageData: buildIconImageData('#9B9B9B'), windowId });
     await browser.browserAction.setTitle({ title: 'Workspaces', windowId });
@@ -542,11 +547,10 @@ browser.windows.onRemoved.addListener(async windowId => {
 
 browser.windows.onFocusChanged.addListener(async windowId => {
   if (windowId === browser.windows.WINDOW_ID_NONE) return;
-  const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
-  const wsId = map[String(windowId)];
-  if (wsId && workspaces[wsId]) {
-    await updateWindowIcon(windowId, workspaces[wsId].color, workspaces[wsId].name);
-    await applyWindowTheme(windowId, workspaces[wsId].color);
+  const meta = _windowMeta[windowId];
+  if (meta) {
+    await updateWindowIcon(windowId, meta.color, meta.name);
+    await applyWindowTheme(windowId, meta.color);
   }
 });
 
@@ -554,11 +558,15 @@ browser.windows.onFocusChanged.addListener(async windowId => {
 // Sync change listener
 // ---------------------------------------------------------------------------
 
-browser.storage.onChanged.addListener(async (changes, area) => {
-  if (area === 'sync' && changes[STORAGE_KEY_WORKSPACES]) {
-    await browser.storage.local.set({ [STORAGE_KEY_LAST_SYNC]: Date.now() });
-    await refreshAllWindows();
-  }
+let _refreshTimer = null;
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'sync' || !changes[STORAGE_KEY_WORKSPACES]) return;
+  browser.storage.local.set({ [STORAGE_KEY_LAST_SYNC]: Date.now() });
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(() => {
+    _refreshTimer = null;
+    refreshAllWindows().catch(err => console.warn('[Workspaces] refreshAllWindows error:', err));
+  }, 2000);
 });
 
 // ---------------------------------------------------------------------------
@@ -692,30 +700,38 @@ async function init() {
     console.warn('[Workspaces] crash-recovery flush failed:', err.message);
   }
 
-  // Close any windows that Firefox restored from a previous workspace session.
-  // These would appear as plain unassigned windows containing workspace tabs,
-  // which is confusing. Workspace sessions are marked via browser.sessions so
-  // we can reliably detect and suppress them here.
+  // Rebuild the window→workspace map for this session.
+  // Window IDs change on every Firefox restart, so the persisted map is stale.
+  // Session values survive restarts, so we use them to re-associate any workspace
+  // windows Firefox restored instead of closing them.
   try {
-    const allWins = await browser.windows.getAll({ windowTypes: ['normal'] });
+    const [allWins, workspaces, map] = await Promise.all([
+      browser.windows.getAll({ windowTypes: ['normal'] }),
+      getWorkspaces(),
+      getWindowMap(),
+    ]);
+
+    // Drop stale entries (old window IDs from previous session).
+    const validIds = new Set(allWins.map(w => String(w.id)));
+    for (const winIdStr of Object.keys(map)) {
+      if (!validIds.has(winIdStr)) delete map[winIdStr];
+    }
+
+    // Re-associate restored workspace windows using their session values.
+    const alreadyAssigned = new Set(Object.values(map));
     for (const win of allWins) {
+      if (map[String(win.id)]) continue;
       const wsId = await browser.sessions.getWindowValue(win.id, 'workspaceId').catch(() => null);
-      if (wsId) {
-        await browser.windows.remove(win.id).catch(() => {});
+      if (wsId && workspaces[wsId] && !alreadyAssigned.has(wsId)) {
+        map[String(win.id)] = wsId;
+        alreadyAssigned.add(wsId);
       }
     }
-  } catch (err) {
-    console.warn('[Workspaces] restored-session cleanup failed:', err.message);
-  }
 
-  // Clean up stale window map entries
-  const [map, windows] = await Promise.all([getWindowMap(), browser.windows.getAll({ windowTypes: ['normal'] })]);
-  const validIds = new Set(windows.map(w => String(w.id)));
-  let dirty = false;
-  for (const winIdStr of Object.keys(map)) {
-    if (!validIds.has(winIdStr)) { delete map[winIdStr]; dirty = true; }
+    await saveWindowMap(map);
+  } catch (err) {
+    console.warn('[Workspaces] startup map rebuild failed:', err.message);
   }
-  if (dirty) await saveWindowMap(map);
 
   await refreshAllWindows();
 
