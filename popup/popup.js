@@ -9,6 +9,10 @@ const state = {
   windowWorkspaceMap: {},
   lastSyncAt: null,
   quota: null,
+  signedIn: false,
+  userEmail: null,
+  redirectUrl: null,
+  remoteConnected: false,
 };
 
 let formMode = 'create';
@@ -24,9 +28,10 @@ const send = msg => browser.runtime.sendMessage(msg);
 
 // ── Views ──────────────────────────────────────────────────────────────────
 const V = {
-  main: document.getElementById('vMain'),
-  form: document.getElementById('vForm'),
-  del:  document.getElementById('vDel'),
+  main:     document.getElementById('vMain'),
+  form:     document.getElementById('vForm'),
+  del:      document.getElementById('vDel'),
+  settings: document.getElementById('vSettings'),
 };
 
 function show(name) {
@@ -34,11 +39,21 @@ function show(name) {
 }
 
 // ── Sync status dot ────────────────────────────────────────────────────────
-function updateSyncDot(lastSyncAt) {
+function updateSyncDot(lastSyncAt, signedIn, remoteConnected) {
   const dot = document.getElementById('syncDot');
+  if (signedIn) {
+    if (remoteConnected) {
+      dot.className = 'sync-dot ok';
+      dot.title = 'Firebase live sync connected';
+    } else {
+      dot.className = 'sync-dot warn';
+      dot.title = 'Firebase sync offline — changes queued locally';
+    }
+    return;
+  }
   if (!lastSyncAt) {
     dot.className = 'sync-dot';
-    dot.title = 'Not yet synced this session';
+    dot.title = 'Not signed in — click ⚙ to set up sync';
     return;
   }
   const age = Date.now() - lastSyncAt;
@@ -216,7 +231,6 @@ function buildSwatches(selectedColor) {
     container.appendChild(btn);
   }
 
-  // Set color picker to current color
   picker.value = selectedColor;
   wheel.classList.toggle('sel', !isPreset);
 }
@@ -361,6 +375,62 @@ function importWorkspaces() {
   document.body.removeChild(input);
 }
 
+// ── Settings view ──────────────────────────────────────────────────────────
+function openSettings() {
+  document.getElementById('settingsErr').textContent = '';
+
+  const signedIn = state.signedIn;
+  document.getElementById('authSignedOut').style.display = signedIn ? 'none' : '';
+  document.getElementById('authSignedIn').style.display  = signedIn ? ''     : 'none';
+
+  if (signedIn) {
+    document.getElementById('authEmail').textContent = state.userEmail || '';
+  }
+  document.getElementById('authRedirectUrl').textContent = state.redirectUrl || '';
+
+  const dot = document.getElementById('settingsDot');
+  if (signedIn) {
+    dot.className = 'sync-dot ' + (state.remoteConnected ? 'ok' : 'warn');
+    dot.title = state.remoteConnected ? 'Connected' : 'Offline / connecting…';
+  } else {
+    dot.className = 'sync-dot';
+    dot.title = 'Not signed in';
+  }
+
+  show('settings');
+}
+
+async function doSignIn() {
+  const btn = document.getElementById('btnSignIn');
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  document.getElementById('settingsErr').textContent = '';
+  try {
+    const result = await send({ type: 'SIGN_IN' });
+    if (result && result.error) throw new Error(result.error);
+    await loadState();
+    openSettings();
+  } catch (err) {
+    document.getElementById('settingsErr').textContent = 'Sign-in failed: ' + err.message;
+    btn.disabled = false;
+    btn.textContent = 'Sign in with Google';
+  }
+}
+
+async function doSignOut() {
+  const btn = document.getElementById('btnSignOut');
+  btn.disabled = true;
+  try {
+    await send({ type: 'SIGN_OUT' });
+    await loadState();
+    openSettings();
+  } catch (err) {
+    console.error('[Workspaces] sign-out failed:', err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ── Load state ─────────────────────────────────────────────────────────────
 async function loadState() {
   const r = await send({ type: 'GET_STATE' });
@@ -371,8 +441,12 @@ async function loadState() {
   state.colors             = r.colors             || [];
   state.lastSyncAt         = r.lastSyncAt         || null;
   state.quota              = r.quota              || null;
+  state.signedIn           = r.signedIn           || false;
+  state.userEmail          = r.userEmail          || null;
+  state.redirectUrl        = r.redirectUrl        || null;
+  state.remoteConnected    = r.remoteConnected    || false;
 
-  updateSyncDot(state.lastSyncAt);
+  updateSyncDot(state.lastSyncAt, state.signedIn, state.remoteConnected);
   updateQuotaWarn(state.quota);
 }
 
@@ -394,6 +468,12 @@ document.getElementById('btnDelOk').onclick     = submitDel;
 
 document.getElementById('btnExport').onclick = exportWorkspaces;
 document.getElementById('btnImport').onclick = importWorkspaces;
+
+document.getElementById('btnSettings').onclick     = openSettings;
+document.getElementById('btnSettingsBack').onclick  = () => show('main');
+document.getElementById('btnSettingsClose').onclick = () => show('main');
+document.getElementById('btnSignIn').onclick        = doSignIn;
+document.getElementById('btnSignOut').onclick       = doSignOut;
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 (async () => {

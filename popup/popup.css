@@ -71,11 +71,28 @@ body {
 .btn-back:hover { background: var(--row-h); }
 .btn-back svg { width: 14px; height: 14px; display: block; }
 
+/* ---- Header right cluster ---- */
+.hdr-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* ---- Icon button (gear, etc.) ---- */
+.btn-icon {
+  width: 18px; height: 18px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: 3px; background: none;
+  cursor: pointer; color: var(--sub);
+}
+.btn-icon:hover { background: var(--row-h); color: var(--txt); }
+.btn-icon svg { width: 12px; height: 12px; display: block; }
+
 /* ---- Sync dot ---- */
 .sync-dot {
   width: 6px; height: 6px;
   border-radius: 50%;
-  margin-left: auto;
   flex-shrink: 0;
   background: var(--sep);
 }
@@ -261,6 +278,37 @@ body {
 .btn-ok:hover, .btn-danger:hover { opacity: .88; }
 
 .form-err { font-size: 10px; color: var(--red); min-height: 14px; }
+
+/* ---- Settings hint ---- */
+.settings-hint {
+  font-size: 9px;
+  color: var(--sub);
+  line-height: 1.5;
+  margin-top: 2px;
+}
+
+/* ---- Auth sections ---- */
+.auth-btn {
+  width: 100%;
+  margin-top: 8px;
+  justify-content: center;
+  padding: 5px 12px;
+}
+.settings-email {
+  font-size: 11px;
+  color: var(--txt);
+  margin-top: 2px;
+  word-break: break-all;
+}
+.settings-redirect {
+  font-size: 8px;
+  font-family: 'Consolas', 'Menlo', monospace;
+  color: var(--sub);
+  word-break: break-all;
+  line-height: 1.4;
+  margin-top: 2px;
+  user-select: all;
+}
 
 /* ---- Delete confirm ---- */
 .del-body { justify-content: center; }

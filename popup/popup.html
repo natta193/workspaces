@@ -13,7 +13,15 @@
   <div id="vMain" class="v on">
     <div class="hdr">
       <span class="hdr-title">Workspaces</span>
-      <span class="sync-dot" id="syncDot" title="Sync status unknown"></span>
+      <div class="hdr-right">
+        <span class="sync-dot" id="syncDot" title="Sync status unknown"></span>
+        <button class="btn-icon" id="btnSettings" title="Firebase sync settings">
+          <svg viewBox="0 0 14 14" fill="none">
+            <path d="M7 9a2 2 0 100-4 2 2 0 000 4z" stroke="currentColor" stroke-width="1.2"/>
+            <path d="M11.3 7c0-.2 0-.4-.03-.6l1.3-1-1-1.73-1.6.53a4.1 4.1 0 00-1.03-.6L9.7 2H7.3l-.27 1.6a4.1 4.1 0 00-1.03.6l-1.6-.53-1 1.73 1.3 1A4.1 4.1 0 004.7 7c0 .2 0 .4.03.6l-1.3 1 1 1.73 1.6-.53c.32.23.67.43 1.03.6L7.3 12h2.4l.27-1.6c.36-.17.71-.37 1.03-.6l1.6.53 1-1.73-1.3-1c.03-.2.03-.4.03-.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
     </div>
     <div class="quota-warn" id="quotaWarn"></div>
     <div class="ws-list" id="wsList"></div>
@@ -75,6 +83,42 @@
     <div class="btns btns-row">
       <button class="btn-cancel" id="btnDelCancel">Cancel</button>
       <button class="btn-danger" id="btnDelOk">Delete</button>
+    </div>
+  </div>
+
+  <!-- ── Settings view (Firebase sync) ───────────────────── -->
+  <div id="vSettings" class="v">
+    <div class="hdr hdr-nav">
+      <button class="btn-back" id="btnSettingsBack">
+        <svg viewBox="0 0 14 14" fill="none"><path d="M9 3L5 7l4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <span class="hdr-title">Firebase Sync</span>
+      <span class="sync-dot" id="settingsDot" style="margin-left:auto"></span>
+    </div>
+    <div class="form">
+
+      <!-- Signed-out state -->
+      <div id="authSignedOut">
+        <p class="settings-hint">Sign in with Google to enable live cross-device sync. Your workspaces are stored under your Google account in Firebase.</p>
+        <button class="btn-ok auth-btn" id="btnSignIn">Sign in with Google</button>
+      </div>
+
+      <!-- Signed-in state -->
+      <div id="authSignedIn">
+        <label class="lbl">Signed in as</label>
+        <p class="settings-email" id="authEmail"></p>
+        <button class="btn-danger auth-btn" id="btnSignOut">Sign out</button>
+      </div>
+
+      <!-- Always visible -->
+      <label class="lbl" style="margin-top:8px">OAuth redirect URL</label>
+      <p class="settings-hint">Register in Google Cloud Console → OAuth credentials → Authorised redirect URIs:</p>
+      <p class="settings-redirect" id="authRedirectUrl"></p>
+
+      <div class="form-err" id="settingsErr"></div>
+    </div>
+    <div class="btns btns-row">
+      <button class="btn-cancel" id="btnSettingsClose">Close</button>
     </div>
   </div>
 

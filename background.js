@@ -18,13 +18,34 @@ const WORKSPACE_COLORS = [
   { name: 'Gray',   value: '#7A7574' },
 ];
 
-const STORAGE_KEY_WORKSPACES = 'workspaces';
-const STORAGE_KEY_WINDOW_MAP  = 'windowWorkspaceMap';
-const STORAGE_KEY_LIVE_TABS   = 'workspaceLiveTabs';
-const STORAGE_KEY_LAST_SYNC   = 'lastSyncAt';
+const STORAGE_KEY_WORKSPACES     = 'workspaces';
+const STORAGE_KEY_WINDOW_MAP     = 'windowWorkspaceMap';
+const STORAGE_KEY_LIVE_TABS      = 'workspaceLiveTabs';
+const STORAGE_KEY_LAST_SYNC      = 'lastSyncAt';
+const STORAGE_KEY_PENDING_WRITES = 'pendingWrites';
+const STORAGE_KEY_AUTH           = 'authData';
 
-// In-memory cache: windowId → { color, name } — kept in sync by updateWindowIcon/resetWindowIcon.
+// Firebase Realtime Database — shared by all approved users.
+// Each Google account gets its own path: /users/{firebaseUid}/workspaces/...
+const FIREBASE_DEFAULT_URL = 'https://workspaces-81907-default-rtdb.firebaseio.com';
+
+// Firebase Web API Key — Project Settings → General → Your apps → Web API Key
+const FIREBASE_API_KEY = 'AIzaSyDUnUpaM2zr8OyRi8uBNByb_KywuL_zivo';
+
+// Google OAuth 2.0 Client ID — Google Cloud Console → APIs & Services → Credentials
+const GOOGLE_CLIENT_ID = '315279990323-hgqd9pq3788ju1et1nk7ucmqcp7usrq0.apps.googleusercontent.com';
+
+// In-memory cache: windowId → { color, name }
 const _windowMeta = {};
+
+// Remote sync state
+let _isOnline            = navigator.onLine;
+const _lastWrittenAt     = {}; // wsId → timestamp (echo suppression)
+let _applyingRemoteDelta = false;
+let _sseSource           = null;
+const _remoteWriteTimers = {};
+let _userId              = null; // Firebase UID, resolved in init()
+let _tokenRefreshTimer   = null;
 
 const SYNC_QUOTA_BYTES = 102400;
 
@@ -64,6 +85,130 @@ async function getQuotaInfo() {
   const ws = await getWorkspaces();
   const bytes = new TextEncoder().encode(JSON.stringify(ws)).length;
   return { bytes, total: SYNC_QUOTA_BYTES, pct: bytes / SYNC_QUOTA_BYTES };
+}
+
+// ---------------------------------------------------------------------------
+// Google / Firebase authentication
+// ---------------------------------------------------------------------------
+
+async function getStoredAuth() {
+  const data = await browser.storage.local.get(STORAGE_KEY_AUTH);
+  return data[STORAGE_KEY_AUTH] || null;
+}
+
+function isAuthValid(auth) {
+  return auth && auth.idToken && auth.expiresAt && Date.now() < auth.expiresAt - 60_000;
+}
+
+// Exchange a Firebase refresh token for a fresh ID token.
+async function refreshFirebaseToken(auth) {
+  const resp = await fetch(
+    `https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(auth.refreshToken)}`,
+    }
+  );
+  const data = await resp.json();
+  if (data.error || !data.id_token) throw new Error(data.error?.message || 'Token refresh failed');
+
+  const updated = {
+    ...auth,
+    idToken:      data.id_token,
+    refreshToken: data.refresh_token || auth.refreshToken,
+    expiresAt:    Date.now() + parseInt(data.expires_in) * 1000,
+  };
+  await browser.storage.local.set({ [STORAGE_KEY_AUTH]: updated });
+  return updated;
+}
+
+// Returns a valid auth object, refreshing the ID token if it is near expiry.
+// Returns null if no auth is stored or if refresh fails.
+async function getValidAuth() {
+  let auth = await getStoredAuth();
+  if (!auth) return null;
+  if (isAuthValid(auth)) return auth;
+  try {
+    auth = await refreshFirebaseToken(auth);
+    return auth;
+  } catch (err) {
+    console.warn('[Workspaces] Token refresh failed:', err.message);
+    return null;
+  }
+}
+
+// Full Google Sign-In → Firebase ID token exchange.
+// Called from the SIGN_IN message handler (user-initiated, from popup).
+async function signInWithGoogle() {
+  const redirectUrl = browser.identity.getRedirectURL();
+
+  // Launch Google OAuth implicit flow — returns access_token in hash.
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+    client_id:     GOOGLE_CLIENT_ID,
+    response_type: 'token',
+    redirect_uri:  redirectUrl,
+    scope:         'openid email profile',
+    prompt:        'select_account',
+  });
+
+  const responseUrl = await browser.identity.launchWebAuthFlow({ url: authUrl, interactive: true });
+  const hash = new URL(responseUrl).hash.slice(1);
+  const params = new URLSearchParams(hash);
+  const accessToken = params.get('access_token');
+  if (!accessToken) throw new Error('No access token in Google response');
+
+  // Exchange Google access token for a Firebase ID token.
+  const fbResp = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=${FIREBASE_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        postBody:             `access_token=${accessToken}&providerId=google.com`,
+        requestUri:           redirectUrl,
+        returnIdpCredential:  true,
+        returnSecureToken:    true,
+      }),
+    }
+  );
+  const fbData = await fbResp.json();
+  if (fbData.error) throw new Error(fbData.error.message);
+
+  const auth = {
+    idToken:      fbData.idToken,
+    refreshToken: fbData.refreshToken,
+    localId:      fbData.localId,   // Firebase UID
+    email:        fbData.email,
+    expiresAt:    Date.now() + parseInt(fbData.expiresIn) * 1000,
+  };
+
+  await browser.storage.local.set({ [STORAGE_KEY_AUTH]: auth });
+  return auth;
+}
+
+async function signOut() {
+  await browser.storage.local.remove(STORAGE_KEY_AUTH);
+  clearTimeout(_tokenRefreshTimer);
+  _tokenRefreshTimer = null;
+  _userId = null;
+  if (_sseSource) { _sseSource.close(); _sseSource = null; }
+}
+
+// Schedule proactive token refresh 5 minutes before expiry.
+function scheduleTokenRefresh(auth) {
+  clearTimeout(_tokenRefreshTimer);
+  const delay = Math.max(0, auth.expiresAt - Date.now() - 5 * 60_000);
+  _tokenRefreshTimer = setTimeout(async () => {
+    try {
+      const refreshed = await refreshFirebaseToken(auth);
+      scheduleTokenRefresh(refreshed);
+      // Reconnect SSE with fresh token
+      await setupRemoteListener();
+    } catch (err) {
+      console.warn('[Workspaces] Scheduled token refresh failed:', err.message);
+    }
+  }, delay);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +365,10 @@ async function createWorkspace(name, color, tabs) {
     tabs: (tabs || []).filter(t => isRestorableUrl(t.url)),
     createdAt: Date.now(),
     lastUsed:  Date.now(),
+    updatedAt: Date.now(),
   };
   await saveWorkspaces(workspaces);
+  remoteWrite(id, workspaces[id]).catch(() => {});
   return workspaces[id];
 }
 
@@ -235,6 +382,7 @@ async function deleteWorkspace(workspaceId) {
     saveWorkspaces(workspaces),
     browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: live }),
   ]);
+  remoteDelete(workspaceId).catch(() => {});
 
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
@@ -251,15 +399,19 @@ async function deleteWorkspace(workspaceId) {
 async function renameWorkspace(workspaceId, name) {
   const workspaces = await getWorkspaces();
   if (!workspaces[workspaceId]) return;
-  workspaces[workspaceId].name = name.trim() || workspaces[workspaceId].name;
+  workspaces[workspaceId].name      = name.trim() || workspaces[workspaceId].name;
+  workspaces[workspaceId].updatedAt = Date.now();
   await saveWorkspaces(workspaces);
+  remoteWrite(workspaceId, workspaces[workspaceId]).catch(() => {});
 }
 
 async function recolorWorkspace(workspaceId, color) {
   const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
   if (!workspaces[workspaceId]) return;
-  workspaces[workspaceId].color = color;
+  workspaces[workspaceId].color     = color;
+  workspaces[workspaceId].updatedAt = Date.now();
   await saveWorkspaces(workspaces);
+  remoteWrite(workspaceId, workspaces[workspaceId]).catch(() => {});
 
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
@@ -271,8 +423,7 @@ async function recolorWorkspace(workspaceId, color) {
 }
 
 // ---------------------------------------------------------------------------
-// Sessions API — marks workspace windows so Firefox session restore can be
-// detected and suppressed on next startup
+// Sessions API
 // ---------------------------------------------------------------------------
 
 async function markWindowAsWorkspace(windowId, workspaceId) {
@@ -323,8 +474,6 @@ async function assignWindowToWorkspace(windowId, workspaceId) {
 
 // ---------------------------------------------------------------------------
 // Tab snapshot
-// Live changes → local storage only (debounced, avoids hammering sync)
-// Window closing → local + sync (immediate, ensures data is persisted)
 // ---------------------------------------------------------------------------
 
 const _tabSaveTimers = {};
@@ -338,30 +487,63 @@ function scheduleTabSave(windowId) {
   }, 600);
 }
 
-async function snapshotToLocal(windowId) {
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); }
-  catch (err) { console.warn('[Workspaces] tabs.query failed:', err.message); return; }
-  if (!tabs.length) return;
+// Reads current tabs + tab groups for a window.
+// Returns { tabs: [{url,title,pinned,groupId}], tabGroups: {key:{title,color,collapsed}} }
+// groupId on each tab is a stable string key (not the browser's numeric group ID).
+// Gracefully handles Firefox versions without the tabGroups API.
+async function buildTabSnapshot(windowId) {
+  const allTabs   = await browser.tabs.query({ windowId });
+  const restorable = allTabs.filter(t => isRestorableUrl(t.url));
 
+  let tabGroups         = {};
+  const browserIdToKey  = {};
+
+  try {
+    if (browser.tabGroups) {
+      const groups = await browser.tabGroups.query({ windowId });
+      for (const g of groups) {
+        const key = `g${Object.keys(tabGroups).length}`;
+        tabGroups[key] = { title: g.title || '', color: g.color || 'grey', collapsed: !!g.collapsed };
+        browserIdToKey[g.id] = key;
+      }
+    }
+  } catch (_) { /* tabGroups API unavailable */ }
+
+  const tabs = restorable.map(t => ({
+    url:     t.url,
+    title:   t.title || t.url,
+    pinned:  t.pinned,
+    groupId: (t.groupId && t.groupId !== -1 && browserIdToKey[t.groupId])
+             ? browserIdToKey[t.groupId]
+             : null,
+  }));
+
+  return { tabs, tabGroups: Object.keys(tabGroups).length ? tabGroups : undefined };
+}
+
+// Read a live snapshot entry — handles both new {tabs,tabGroups} format and legacy array.
+function parseLiveEntry(entry) {
+  if (!entry) return { tabs: [], tabGroups: undefined };
+  if (Array.isArray(entry)) return { tabs: entry, tabGroups: undefined };
+  return { tabs: entry.tabs || [], tabGroups: entry.tabGroups };
+}
+
+async function snapshotToLocal(windowId) {
   const map = await getWindowMap();
   const workspaceId = map[String(windowId)];
   if (!workspaceId) return;
 
+  let snapshot;
+  try { snapshot = await buildTabSnapshot(windowId); }
+  catch (err) { console.warn('[Workspaces] buildTabSnapshot failed:', err.message); return; }
+  if (!snapshot.tabs.length) return;
+
   const live = await getLiveTabs();
-  live[workspaceId] = tabs
-    .map(t => ({ url: t.url, title: t.title || t.url, pinned: t.pinned }))
-    .filter(t => isRestorableUrl(t.url));
+  live[workspaceId] = snapshot;
   await browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: live });
 }
 
 async function snapshotAndFlushToSync(windowId) {
-  // Query tabs FIRST before any awaits — tabs disappear fast when closing
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); }
-  catch (err) { console.warn('[Workspaces] tabs.query failed:', err.message); return; }
-  if (!tabs.length) return;
-
   const map = await getWindowMap();
   const workspaceId = map[String(windowId)];
   if (!workspaceId) return;
@@ -370,20 +552,292 @@ async function snapshotAndFlushToSync(windowId) {
   const workspace  = workspaces[workspaceId];
   if (!workspace) return;
 
-  const snappedTabs = tabs
-    .map(t => ({ url: t.url, title: t.title || t.url, pinned: t.pinned }))
-    .filter(t => isRestorableUrl(t.url));
+  let snapshot;
+  try { snapshot = await buildTabSnapshot(windowId); }
+  catch (err) { console.warn('[Workspaces] buildTabSnapshot failed:', err.message); return; }
+  if (!snapshot.tabs.length) return;
 
-  workspace.tabs    = snappedTabs;
-  workspace.lastUsed = Date.now();
+  workspace.tabs      = snapshot.tabs;
+  workspace.tabGroups = snapshot.tabGroups;
+  workspace.lastUsed  = Date.now();
+  workspace.updatedAt = Date.now();
 
   const live = await getLiveTabs();
-  live[workspaceId] = snappedTabs;
+  live[workspaceId] = snapshot;
 
   await Promise.all([
     saveWorkspaces(workspaces),
     browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: live }),
   ]);
+
+  remoteWrite(workspaceId, workspace).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Remote sync — Firebase Realtime Database via REST + SSE
+// ---------------------------------------------------------------------------
+
+// Builds a Firebase URL scoped to the authenticated user:
+//   {base}/users/{firebaseUid}{path}.json?auth={idToken}
+function buildFirebaseUrl(idToken, path) {
+  const base   = FIREBASE_DEFAULT_URL;
+  const prefix = _userId ? `/users/${encodeURIComponent(_userId)}` : '';
+  const auth   = idToken ? `?auth=${encodeURIComponent(idToken)}` : '';
+  return `${base}${prefix}${path}.json${auth}`;
+}
+
+async function remoteWrite(wsId, workspaceState) {
+  const auth = await getValidAuth();
+  if (!auth) return; // not signed in — skip remote write
+
+  if (!_isOnline) {
+    await queuePendingWrite(wsId, workspaceState);
+    return;
+  }
+
+  _lastWrittenAt[wsId] = workspaceState.updatedAt;
+  const url = buildFirebaseUrl(auth.idToken, `/workspaces/${wsId}`);
+  try {
+    const resp = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(workspaceState),
+    });
+    if (!resp.ok) {
+      console.warn('[Workspaces] Remote write failed:', resp.status);
+      await queuePendingWrite(wsId, workspaceState);
+    }
+  } catch (err) {
+    console.warn('[Workspaces] Remote write error:', err.message);
+    await queuePendingWrite(wsId, workspaceState);
+  }
+}
+
+async function remoteDelete(wsId) {
+  const auth = await getValidAuth();
+  if (!auth) return;
+  const url = buildFirebaseUrl(auth.idToken, `/workspaces/${wsId}`);
+  try {
+    await fetch(url, { method: 'DELETE' });
+  } catch (err) {
+    console.warn('[Workspaces] Remote delete error:', err.message);
+  }
+}
+
+async function queuePendingWrite(wsId, workspaceState) {
+  const data  = await browser.storage.local.get(STORAGE_KEY_PENDING_WRITES);
+  const queue = data[STORAGE_KEY_PENDING_WRITES] || {};
+  const existing = queue[wsId];
+  if (!existing || workspaceState.updatedAt > existing.timestamp) {
+    queue[wsId] = { state: workspaceState, timestamp: workspaceState.updatedAt };
+    await browser.storage.local.set({ [STORAGE_KEY_PENDING_WRITES]: queue });
+  }
+}
+
+async function flushOfflineQueue() {
+  const auth = await getValidAuth();
+  if (!auth) return;
+
+  const data  = await browser.storage.local.get(STORAGE_KEY_PENDING_WRITES);
+  const queue = data[STORAGE_KEY_PENDING_WRITES] || {};
+  if (!Object.keys(queue).length) return;
+
+  const updated = { ...queue };
+  for (const [wsId, { state: queuedState, timestamp }] of Object.entries(queue)) {
+    try {
+      const url     = buildFirebaseUrl(auth.idToken, `/workspaces/${wsId}/updatedAt`);
+      const resp    = await fetch(url);
+      const remoteTs = resp.ok ? (await resp.json()) || 0 : 0;
+      if (timestamp > remoteTs) await remoteWrite(wsId, queuedState);
+      delete updated[wsId];
+    } catch (err) {
+      console.warn('[Workspaces] flushOfflineQueue error for', wsId, ':', err.message);
+    }
+  }
+  await browser.storage.local.set({ [STORAGE_KEY_PENDING_WRITES]: updated });
+}
+
+function scheduleRemoteWrite(windowId) {
+  clearTimeout(_remoteWriteTimers[windowId]);
+  _remoteWriteTimers[windowId] = setTimeout(async () => {
+    delete _remoteWriteTimers[windowId];
+    if (_applyingRemoteDelta) return;
+
+    let tabs;
+    try { tabs = await browser.tabs.query({ windowId }); }
+    catch (err) { return; }
+    if (!tabs.length) return;
+
+    const map = await getWindowMap();
+    const wsId = map[String(windowId)];
+    if (!wsId) return;
+
+    const workspaces = await getWorkspaces();
+    const workspace  = workspaces[wsId];
+    if (!workspace) return;
+
+    let snapshot;
+    try { snapshot = await buildTabSnapshot(windowId); }
+    catch (err) { return; }
+    if (!snapshot.tabs.length) return;
+
+    await remoteWrite(wsId, {
+      ...workspace,
+      tabs:      snapshot.tabs,
+      tabGroups: snapshot.tabGroups,
+      updatedAt: Date.now(),
+    });
+  }, 400);
+}
+
+async function applyTabGroups(windowId, savedTabs, tabGroups) {
+  if (!browser.tabGroups) return;
+  try {
+    const currentTabs = await browser.tabs.query({ windowId });
+    const urlToTabId  = {};
+    for (const t of currentTabs) urlToTabId[t.url] = t.id;
+
+    // Remove all existing groups so we start clean
+    const existingGroups = await browser.tabGroups.query({ windowId });
+    for (const g of existingGroups) {
+      const members = await browser.tabs.query({ windowId, groupId: g.id });
+      if (members.length) await browser.tabs.ungroup(members.map(t => t.id)).catch(() => {});
+    }
+
+    // Build groupKey → tabIds from saved tab list
+    const groupKeyToTabIds = {};
+    for (const tab of savedTabs) {
+      if (tab.groupId && tabGroups[tab.groupId] && urlToTabId[tab.url]) {
+        (groupKeyToTabIds[tab.groupId] ??= []).push(urlToTabId[tab.url]);
+      }
+    }
+
+    for (const [gKey, tabIds] of Object.entries(groupKeyToTabIds)) {
+      if (!tabIds.length) continue;
+      const def = tabGroups[gKey];
+      const gId = await browser.tabs.group({ tabIds, createProperties: { windowId } });
+      await browser.tabGroups.update(gId, {
+        title:     def.title    || '',
+        color:     def.color    || 'grey',
+        collapsed: !!def.collapsed,
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[Workspaces] applyTabGroups failed:', err.message);
+  }
+}
+
+async function applyRemoteDelta(windowId, newTabs, tabGroups) {
+  _applyingRemoteDelta = true;
+  try {
+    const currentTabs = await browser.tabs.query({ windowId });
+    const currentUrls = new Set(currentTabs.map(t => t.url));
+    const newUrls     = new Set(newTabs.map(t => t.url));
+
+    const toClose = currentTabs.filter(t => !newUrls.has(t.url));
+    const toOpen  = newTabs.filter(t => !currentUrls.has(t.url) && isRestorableUrl(t.url));
+
+    for (const tab of toClose) await browser.tabs.remove(tab.id).catch(() => {});
+    for (const tab of toOpen) {
+      await browser.tabs.create({ windowId, url: tab.url, pinned: !!tab.pinned }).catch(() => {});
+    }
+
+    if (toClose.length === currentTabs.length && toOpen.length === 0) {
+      await browser.tabs.create({ windowId }).catch(() => {});
+    }
+
+    if (tabGroups && Object.keys(tabGroups).length) {
+      await applyTabGroups(windowId, newTabs, tabGroups);
+    }
+  } finally {
+    _applyingRemoteDelta = false;
+  }
+}
+
+async function setupRemoteListener() {
+  if (_sseSource) { _sseSource.close(); _sseSource = null; }
+
+  const auth = await getValidAuth();
+  if (!auth) return; // no auth — sync disabled
+
+  const url    = buildFirebaseUrl(auth.idToken, '/workspaces');
+  const source = new EventSource(url);
+  _sseSource   = source;
+
+  async function handleUpdates(updates) {
+    if (!updates || typeof updates !== 'object') return;
+
+    const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
+    let changed = false;
+
+    for (const [wsId, remoteWs] of Object.entries(updates)) {
+      if (!remoteWs || typeof remoteWs !== 'object') {
+        if (workspaces[wsId]) { delete workspaces[wsId]; changed = true; }
+        continue;
+      }
+
+      // Skip our own echoed write
+      if (_lastWrittenAt[wsId] && remoteWs.updatedAt === _lastWrittenAt[wsId]) continue;
+
+      const localTs  = workspaces[wsId] ? (workspaces[wsId].updatedAt || 0) : 0;
+      const remoteTs = remoteWs.updatedAt || 0;
+      if (remoteTs <= localTs) continue;
+
+      workspaces[wsId] = remoteWs;
+      changed = true;
+
+      for (const [winIdStr, wId] of Object.entries(map)) {
+        if (wId === wsId) {
+          applyRemoteDelta(parseInt(winIdStr), remoteWs.tabs || [], remoteWs.tabGroups)
+            .catch(err => console.warn('[Workspaces] applyRemoteDelta error:', err.message));
+          break;
+        }
+      }
+    }
+
+    if (changed) await saveWorkspaces(workspaces);
+  }
+
+  source.addEventListener('put', async event => {
+    try {
+      const { path, data } = JSON.parse(event.data);
+      if (path === '/') {
+        await handleUpdates(data || {});
+      } else {
+        const wsId = path.replace(/^\//, '').split('/')[0];
+        if (wsId) await handleUpdates({ [wsId]: data });
+      }
+    } catch (err) {
+      console.warn('[Workspaces] SSE put error:', err.message);
+    }
+  });
+
+  source.addEventListener('patch', async event => {
+    try {
+      const { path, data } = JSON.parse(event.data);
+      if (!data) return;
+      if (path === '/') {
+        await handleUpdates(data);
+      } else {
+        const wsId = path.replace(/^\//, '').split('/')[0];
+        if (wsId) await handleUpdates({ [wsId]: data });
+      }
+    } catch (err) {
+      console.warn('[Workspaces] SSE patch error:', err.message);
+    }
+  });
+
+  // Firebase sends 'cancel' when auth is rejected (not in approved list)
+  source.addEventListener('cancel', event => {
+    console.warn('[Workspaces] Firebase rejected auth — check approved email list in rules:', event.data);
+    source.close();
+    _sseSource = null;
+  });
+
+  source.addEventListener('open', () => {
+    _isOnline = true;
+    flushOfflineQueue().catch(() => {});
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -397,13 +851,10 @@ async function openWorkspace(workspaceId) {
   const workspace = workspaces[workspaceId];
   if (!workspace) return { error: 'Workspace not found' };
 
-  // Already open in a window → focus it (enforces single-window-per-workspace)
   for (const [winIdStr, wsId] of Object.entries(map)) {
     if (wsId === workspaceId) {
       const winId = parseInt(winIdStr);
       try {
-        // Confirm the window still belongs to this workspace — Firefox reuses
-        // window IDs, so a stale map entry can silently point to a different window.
         const sessionWsId = await browser.sessions.getWindowValue(winId, 'workspaceId').catch(() => null);
         if (sessionWsId !== workspaceId) throw new Error('stale map entry');
         const existingWin = await browser.windows.get(winId);
@@ -420,9 +871,10 @@ async function openWorkspace(workspaceId) {
     }
   }
 
-  // Prefer live (in-progress) tabs, fall back to last-saved sync tabs
   const live = await getLiveTabs();
-  const tabs = live[workspaceId] || workspace.tabs || [];
+  const { tabs, tabGroups } = live[workspaceId]
+    ? parseLiveEntry(live[workspaceId])
+    : { tabs: workspace.tabs || [], tabGroups: workspace.tabGroups };
   const restorableUrls = tabs.map(t => t.url).filter(isRestorableUrl);
   const createOpts = restorableUrls.length > 0 ? { url: restorableUrls, focused: true } : { focused: true };
 
@@ -437,14 +889,42 @@ async function openWorkspace(workspaceId) {
     _extensionIsCreatingWindow = false;
   }
 
+  const opened = await browser.tabs.query({ windowId: win.id });
+
   if (tabs.some(t => t.pinned)) {
-    const opened = await browser.tabs.query({ windowId: win.id });
     for (let i = 0; i < opened.length; i++) {
       if (tabs[i]?.pinned) {
         await browser.tabs.update(opened[i].id, { pinned: true }).catch(
           err => console.warn('[Workspaces] pin failed:', err.message)
         );
       }
+    }
+  }
+
+  if (tabGroups && Object.keys(tabGroups).length) {
+    // Match opened tabs positionally to saved tabs so we can assign group IDs
+    const groupKeyToTabIds = {};
+    for (let i = 0; i < Math.min(tabs.length, opened.length); i++) {
+      const gKey = tabs[i].groupId;
+      if (gKey && tabGroups[gKey]) {
+        (groupKeyToTabIds[gKey] ??= []).push(opened[i].id);
+      }
+    }
+    try {
+      if (browser.tabGroups) {
+        for (const [gKey, tabIds] of Object.entries(groupKeyToTabIds)) {
+          if (!tabIds.length) continue;
+          const def = tabGroups[gKey];
+          const gId = await browser.tabs.group({ tabIds, createProperties: { windowId: win.id } });
+          await browser.tabGroups.update(gId, {
+            title:     def.title    || '',
+            color:     def.color    || 'grey',
+            collapsed: !!def.collapsed,
+          }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.warn('[Workspaces] Tab group restore failed:', err.message);
     }
   }
 
@@ -470,12 +950,9 @@ async function openWorkspaceByName(name) {
 }
 
 // ---------------------------------------------------------------------------
-// URL interception — allows CLI script / school.sh to open a workspace
-// URL format: https://workspaces.firefox.ext/open/<encoded-name>
+// URL interception
 // ---------------------------------------------------------------------------
 
-// Guards against tabs.onUpdated and init()'s URL scan both firing at startup,
-// which would call openWorkspace twice before the window map is updated.
 const _handledOpenTabs = new Set();
 
 async function handleWorkspaceOpenUrl(tabId, url) {
@@ -492,7 +969,9 @@ async function handleWorkspaceOpenUrl(tabId, url) {
 // ---------------------------------------------------------------------------
 
 browser.tabs.onCreated.addListener(tab => {
-  if (tab.windowId) scheduleTabSave(tab.windowId);
+  if (_applyingRemoteDelta || !tab.windowId) return;
+  scheduleTabSave(tab.windowId);
+  scheduleRemoteWrite(tab.windowId);
 });
 
 browser.tabs.onRemoved.addListener((tabId, info) => {
@@ -501,10 +980,15 @@ browser.tabs.onRemoved.addListener((tabId, info) => {
       _closingWindowsSnapshotted.add(info.windowId);
       clearTimeout(_tabSaveTimers[info.windowId]);
       delete _tabSaveTimers[info.windowId];
+      clearTimeout(_remoteWriteTimers[info.windowId]);
+      delete _remoteWriteTimers[info.windowId];
       snapshotAndFlushToSync(info.windowId);
     }
   } else {
-    scheduleTabSave(info.windowId);
+    if (!_applyingRemoteDelta) {
+      scheduleTabSave(info.windowId);
+      scheduleRemoteWrite(info.windowId);
+    }
   }
 });
 
@@ -514,22 +998,53 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       await handleWorkspaceOpenUrl(tabId, changeInfo.url);
       return;
     }
-    scheduleTabSave(tab.windowId);
+    if (!_applyingRemoteDelta) {
+      scheduleTabSave(tab.windowId);
+      scheduleRemoteWrite(tab.windowId);
+    }
   } else if (changeInfo.title !== undefined) {
-    scheduleTabSave(tab.windowId);
+    if (!_applyingRemoteDelta) {
+      scheduleTabSave(tab.windowId);
+      scheduleRemoteWrite(tab.windowId);
+    }
   }
 });
 
-browser.tabs.onMoved.addListener((tabId, info)   => { scheduleTabSave(info.windowId); });
-browser.tabs.onDetached.addListener((tabId, info) => { scheduleTabSave(info.oldWindowId); });
-browser.tabs.onAttached.addListener((tabId, info) => { scheduleTabSave(info.newWindowId); });
+browser.tabs.onMoved.addListener((tabId, info) => {
+  if (!_applyingRemoteDelta) { scheduleTabSave(info.windowId); scheduleRemoteWrite(info.windowId); }
+});
+browser.tabs.onDetached.addListener((tabId, info) => {
+  if (!_applyingRemoteDelta) { scheduleTabSave(info.oldWindowId); scheduleRemoteWrite(info.oldWindowId); }
+});
+browser.tabs.onAttached.addListener((tabId, info) => {
+  if (!_applyingRemoteDelta) { scheduleTabSave(info.newWindowId); scheduleRemoteWrite(info.newWindowId); }
+});
+
+// Save when a tab moves between groups or is ungrouped
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.groupId !== undefined && !_applyingRemoteDelta && tab.windowId) {
+    scheduleTabSave(tab.windowId);
+    scheduleRemoteWrite(tab.windowId);
+  }
+}, { properties: ['groupId'] });
+
+// Save when a group is renamed, recolored, or collapsed
+if (browser.tabGroups) {
+  const onGroupChange = group => {
+    if (!_applyingRemoteDelta && group.windowId) {
+      scheduleTabSave(group.windowId);
+      scheduleRemoteWrite(group.windowId);
+    }
+  };
+  browser.tabGroups.onCreated.addListener(onGroupChange);
+  browser.tabGroups.onRemoved.addListener(onGroupChange);
+  browser.tabGroups.onUpdated.addListener(onGroupChange);
+}
 
 // ---------------------------------------------------------------------------
 // Window event listeners
 // ---------------------------------------------------------------------------
 
-// New windows opened by the user get no automatic workspace assignment.
-// The user opens workspaces explicitly via the popup or the CLI script.
 browser.windows.onCreated.addListener(win => {
   if (win.type !== 'normal' || _extensionIsCreatingWindow) return;
   // intentionally no auto-assignment
@@ -538,6 +1053,8 @@ browser.windows.onCreated.addListener(win => {
 browser.windows.onRemoved.addListener(async windowId => {
   clearTimeout(_tabSaveTimers[windowId]);
   delete _tabSaveTimers[windowId];
+  clearTimeout(_remoteWriteTimers[windowId]);
+  delete _remoteWriteTimers[windowId];
   _closingWindowsSnapshotted.delete(windowId);
 
   const map = await getWindowMap();
@@ -555,7 +1072,7 @@ browser.windows.onFocusChanged.addListener(async windowId => {
 });
 
 // ---------------------------------------------------------------------------
-// Sync change listener
+// Sync change listener (kept for workspace create/delete/rename from other devices)
 // ---------------------------------------------------------------------------
 
 let _refreshTimer = null;
@@ -570,8 +1087,7 @@ browser.storage.onChanged.addListener((changes, area) => {
 });
 
 // ---------------------------------------------------------------------------
-// Periodic alarm — fallback for missed onChanged events (e.g. browser was
-// closed when the other device synced)
+// Periodic alarm fallback
 // ---------------------------------------------------------------------------
 
 browser.alarms.onAlarm.addListener(async alarm => {
@@ -594,6 +1110,7 @@ browser.runtime.onMessage.addListener(async message => {
         browser.storage.local.get(STORAGE_KEY_LAST_SYNC),
         getQuotaInfo(),
       ]);
+      const auth = await getStoredAuth();
       let currentWindowId = null;
       try {
         const win = await browser.windows.getLastFocused({ windowTypes: ['normal'] });
@@ -606,8 +1123,12 @@ browser.runtime.onMessage.addListener(async message => {
         workspaces, currentWorkspaceId, currentWindowId,
         windowWorkspaceMap: map,
         colors: WORKSPACE_COLORS,
-        lastSyncAt: localData[STORAGE_KEY_LAST_SYNC] || null,
+        lastSyncAt:      localData[STORAGE_KEY_LAST_SYNC] || null,
         quota,
+        signedIn:        isAuthValid(auth),
+        userEmail:       auth ? auth.email : null,
+        remoteConnected: !!(_sseSource && _sseSource.readyState === EventSource.OPEN),
+        redirectUrl:     browser.identity.getRedirectURL(),
       };
     }
 
@@ -645,11 +1166,33 @@ browser.runtime.onMessage.addListener(async message => {
     case 'GET_COLORS':
       return { colors: WORKSPACE_COLORS };
 
+    case 'SIGN_IN': {
+      try {
+        const auth = await signInWithGoogle();
+        _userId = auth.localId;
+        scheduleTokenRefresh(auth);
+        await setupRemoteListener();
+        return { success: true, email: auth.email };
+      } catch (err) {
+        console.warn('[Workspaces] Sign-in failed:', err.message);
+        return { error: err.message };
+      }
+    }
+
+    case 'SIGN_OUT': {
+      await signOut();
+      return { success: true };
+    }
+
     case 'EXPORT_WORKSPACES': {
       const [workspaces, live] = await Promise.all([getWorkspaces(), getLiveTabs()]);
       const out = JSON.parse(JSON.stringify(workspaces));
-      for (const [wsId, tabs] of Object.entries(live)) {
-        if (out[wsId]) out[wsId].tabs = tabs;
+      for (const [wsId, entry] of Object.entries(live)) {
+        if (out[wsId]) {
+          const { tabs, tabGroups } = parseLiveEntry(entry);
+          out[wsId].tabs      = tabs;
+          out[wsId].tabGroups = tabGroups;
+        }
       }
       return { data: out };
     }
@@ -662,16 +1205,21 @@ browser.runtime.onMessage.addListener(async message => {
       for (const [id, ws] of Object.entries(data)) {
         if (!ws.id || !ws.name || !ws.color) continue;
         existing[id] = {
-          id: ws.id,
-          name: String(ws.name),
-          color: String(ws.color),
-          tabs: Array.isArray(ws.tabs) ? ws.tabs : [],
+          id:        ws.id,
+          name:      String(ws.name),
+          color:     String(ws.color),
+          tabs:      Array.isArray(ws.tabs) ? ws.tabs : [],
+          tabGroups: (ws.tabGroups && typeof ws.tabGroups === 'object') ? ws.tabGroups : undefined,
           createdAt: ws.createdAt || Date.now(),
           lastUsed:  ws.lastUsed  || Date.now(),
+          updatedAt: Date.now(),
         };
         count++;
       }
       await saveWorkspaces(existing);
+      for (const [id, ws] of Object.entries(existing)) {
+        remoteWrite(id, ws).catch(() => {});
+      }
       return { success: true, count };
     }
 
@@ -685,13 +1233,18 @@ browser.runtime.onMessage.addListener(async message => {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  // Flush any live tabs left over from a previous crash into sync
+  // Flush live tabs from previous crash into sync
   try {
     const [live, workspaces] = await Promise.all([getLiveTabs(), getWorkspaces()]);
     if (Object.keys(live).length) {
       let changed = false;
-      for (const [wsId, tabs] of Object.entries(live)) {
-        if (workspaces[wsId]) { workspaces[wsId].tabs = tabs; changed = true; }
+      for (const [wsId, entry] of Object.entries(live)) {
+        if (workspaces[wsId]) {
+          const { tabs, tabGroups } = parseLiveEntry(entry);
+          workspaces[wsId].tabs      = tabs;
+          workspaces[wsId].tabGroups = tabGroups;
+          changed = true;
+        }
       }
       if (changed) await saveWorkspaces(workspaces);
       await browser.storage.local.set({ [STORAGE_KEY_LIVE_TABS]: {} });
@@ -700,10 +1253,7 @@ async function init() {
     console.warn('[Workspaces] crash-recovery flush failed:', err.message);
   }
 
-  // Rebuild the window→workspace map for this session.
-  // Window IDs change on every Firefox restart, so the persisted map is stale.
-  // Session values survive restarts, so we use them to re-associate any workspace
-  // windows Firefox restored instead of closing them.
+  // Rebuild window→workspace map
   try {
     const [allWins, workspaces, map] = await Promise.all([
       browser.windows.getAll({ windowTypes: ['normal'] }),
@@ -711,13 +1261,11 @@ async function init() {
       getWindowMap(),
     ]);
 
-    // Drop stale entries (old window IDs from previous session).
     const validIds = new Set(allWins.map(w => String(w.id)));
     for (const winIdStr of Object.keys(map)) {
       if (!validIds.has(winIdStr)) delete map[winIdStr];
     }
 
-    // Re-associate restored workspace windows using their session values.
     const alreadyAssigned = new Set(Object.values(map));
     for (const win of allWins) {
       if (map[String(win.id)]) continue;
@@ -735,7 +1283,7 @@ async function init() {
 
   await refreshAllWindows();
 
-  // Handle any workspace-open URLs already loaded (e.g. Firefox started via open-workspace.sh)
+  // Handle workspace-open URLs already loaded at startup
   try {
     const allTabs = await browser.tabs.query({});
     for (const tab of allTabs) {
@@ -747,7 +1295,24 @@ async function init() {
     console.warn('[Workspaces] startup URL scan failed:', err.message);
   }
 
-  // Periodic alarm — re-checks sync every 2 minutes as a fallback
+  // Restore Firebase connection if already signed in
+  const auth = await getValidAuth();
+  if (auth) {
+    _userId = auth.localId;
+    scheduleTokenRefresh(auth);
+  }
+
+  // Online/offline tracking for the offline queue
+  self.addEventListener('online', () => {
+    _isOnline = true;
+    flushOfflineQueue().catch(() => {});
+  });
+  self.addEventListener('offline', () => { _isOnline = false; });
+
+  // Start Firebase real-time listener (no-op if not signed in)
+  await setupRemoteListener();
+
+  // Periodic alarm fallback
   await browser.alarms.create('ws-sync-check', { periodInMinutes: 2 });
 }
 
