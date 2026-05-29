@@ -274,6 +274,12 @@ async function submitForm() {
   const name = document.getElementById('fName').value.trim();
   if (!name) { document.getElementById('formErr').textContent = 'Name is required.'; return; }
 
+  const isDup = Object.values(state.workspaces).some(w =>
+    (formMode !== 'edit' || w.id !== formWorkspaceId) &&
+    w.name.trim().toLowerCase() === name.toLowerCase()
+  );
+  if (isDup) { document.getElementById('formErr').textContent = 'A workspace with that name already exists.'; return; }
+
   const btn = document.getElementById('btnFormOk');
   btn.disabled = true;
 

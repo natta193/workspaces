@@ -227,6 +227,10 @@ function isRestorableUrl(url) {
 
 async function createWorkspace(name, color, tabs) {
   const workspaces = await getWorkspaces();
+  const trimmed = name.trim();
+  if (Object.values(workspaces).some(w => w.name.trim().toLowerCase() === trimmed.toLowerCase())) {
+    throw new Error(`A workspace named "${trimmed}" already exists`);
+  }
   const id = generateId();
   workspaces[id] = {
     id, name, color,
@@ -267,7 +271,13 @@ async function deleteWorkspace(workspaceId) {
 async function renameWorkspace(workspaceId, name) {
   const workspaces = await getWorkspaces();
   if (!workspaces[workspaceId]) return;
-  workspaces[workspaceId].name      = name.trim() || workspaces[workspaceId].name;
+  const trimmed = name.trim() || workspaces[workspaceId].name;
+  if (trimmed.toLowerCase() !== workspaces[workspaceId].name.toLowerCase()) {
+    if (Object.values(workspaces).some(w => w.id !== workspaceId && w.name.trim().toLowerCase() === trimmed.toLowerCase())) {
+      throw new Error(`A workspace named "${trimmed}" already exists`);
+    }
+  }
+  workspaces[workspaceId].name      = trimmed;
   workspaces[workspaceId].updatedAt = Date.now();
   await saveWorkspaces(workspaces);
   remoteWrite(workspaceId, workspaces[workspaceId]).catch(() => {});
@@ -338,6 +348,22 @@ async function assignWindowToWorkspace(windowId, workspaceId) {
 
   workspace.lastUsed = Date.now();
   await saveWorkspaces(workspaces);
+}
+
+// Recovery helper: re-link a window to its workspace via its persisted session value.
+// Mutates map in-place and persists it. Also re-applies icon/theme.
+async function recoverWindowMapping(windowId, workspaces, map) {
+  try {
+    const wsId = await browser.sessions.getWindowValue(windowId, 'workspaceId').catch(() => null);
+    if (wsId && workspaces[wsId]) {
+      map[String(windowId)] = wsId;
+      saveWindowMap(map).catch(() => {});
+      updateWindowIcon(windowId, workspaces[wsId].color, workspaces[wsId].name).catch(() => {});
+      applyWindowTheme(windowId, workspaces[wsId].color).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[Workspaces] recoverWindowMapping failed:', err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -928,10 +954,18 @@ browser.windows.onRemoved.addListener(async windowId => {
 
 browser.windows.onFocusChanged.addListener(async windowId => {
   if (windowId === browser.windows.WINDOW_ID_NONE) return;
-  const meta = _windowMeta[windowId];
-  if (meta) {
-    await updateWindowIcon(windowId, meta.color, meta.name);
-    await applyWindowTheme(windowId, meta.color);
+  const [workspaces, map] = await Promise.all([getWorkspaces(), getWindowMap()]);
+  if (!map[String(windowId)]) await recoverWindowMapping(windowId, workspaces, map);
+  const wsId = map[String(windowId)];
+  if (wsId && workspaces[wsId]) {
+    await updateWindowIcon(windowId, workspaces[wsId].color, workspaces[wsId].name);
+    await applyWindowTheme(windowId, workspaces[wsId].color);
+  } else {
+    const meta = _windowMeta[windowId];
+    if (meta) {
+      await updateWindowIcon(windowId, meta.color, meta.name);
+      await applyWindowTheme(windowId, meta.color);
+    }
   }
 });
 
@@ -980,6 +1014,9 @@ browser.runtime.onMessage.addListener(async message => {
         if (win && win.id !== browser.windows.WINDOW_ID_NONE) currentWindowId = win.id;
       } catch (err) {
         console.warn('[Workspaces] getLastFocused failed:', err.message);
+      }
+      if (currentWindowId && !map[String(currentWindowId)]) {
+        await recoverWindowMapping(currentWindowId, workspaces, map);
       }
       const currentWorkspaceId = currentWindowId ? (map[String(currentWindowId)] || null) : null;
       return {
@@ -1120,6 +1157,29 @@ async function init() {
       if (wsId && workspaces[wsId] && !alreadyAssigned.has(wsId)) {
         map[String(win.id)] = wsId;
         alreadyAssigned.add(wsId);
+      }
+    }
+
+    // Third pass: tab-overlap heuristic for windows with no session value
+    for (const win of allWins) {
+      if (map[String(win.id)]) continue;
+      const winTabs = await browser.tabs.query({ windowId: win.id });
+      const winUrls = new Set(winTabs.map(t => t.url).filter(isRestorableUrl));
+      if (winUrls.size < 2) continue;
+      let bestWsId = null, bestScore = 0;
+      for (const [wsId, ws] of Object.entries(workspaces)) {
+        if (alreadyAssigned.has(wsId)) continue;
+        const wsUrls = new Set((ws.tabs || []).map(t => t.url).filter(isRestorableUrl));
+        if (wsUrls.size < 2) continue;
+        const intersection = [...winUrls].filter(u => wsUrls.has(u)).length;
+        const jaccard = intersection / (winUrls.size + wsUrls.size - intersection);
+        if (jaccard > bestScore && jaccard >= 0.5) { bestScore = jaccard; bestWsId = wsId; }
+      }
+      if (bestWsId) {
+        map[String(win.id)] = bestWsId;
+        alreadyAssigned.add(bestWsId);
+        await markWindowAsWorkspace(win.id, bestWsId);
+        console.log(`[Workspaces] Auto-linked window ${win.id} → "${workspaces[bestWsId].name}" (${Math.round(bestScore * 100)}% tab match)`);
       }
     }
 
