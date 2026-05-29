@@ -310,6 +310,28 @@ body {
   user-select: all;
 }
 
+/* ---- Sync banner (not signed in) ---- */
+.sync-banner {
+  display: none;
+  font-size: 10px;
+  color: var(--red);
+  background: rgba(197,15,31,.08);
+  padding: 4px 10px;
+  border-bottom: 1px solid rgba(197,15,31,.15);
+  flex-shrink: 0;
+}
+.sync-banner.visible { display: block; }
+.sync-banner-btn {
+  background: none; border: none; padding: 0;
+  color: var(--red); font-size: 10px; cursor: pointer;
+  text-decoration: underline;
+}
+
+/* ---- Debug section ---- */
+.debug-info { font-size: 9px; color: var(--sub); line-height: 1.6; }
+.debug-ws   { margin-top: 4px; padding: 3px 0; border-top: 1px solid var(--sep); }
+.debug-ws-name { font-weight: 700; color: var(--txt); }
+
 /* ---- Delete confirm ---- */
 .del-body { justify-content: center; }
 .del-q    { font-size: 12px; line-height: 1.5; margin-bottom: 5px; }

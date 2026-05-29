@@ -70,6 +70,21 @@ function updateSyncDot(lastSyncAt, signedIn, remoteConnected) {
   }
 }
 
+// ── Sync banner ────────────────────────────────────────────────────────────
+function updateSyncBanner(signedIn) {
+  document.getElementById('syncBanner').classList.toggle('visible', !signedIn);
+}
+
+// ── Time helper ────────────────────────────────────────────────────────────
+function timeAgo(ts) {
+  if (!ts) return 'never';
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60)  return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
 // ── Quota warning ──────────────────────────────────────────────────────────
 function updateQuotaWarn(quota) {
   const el = document.getElementById('quotaWarn');
@@ -397,7 +412,41 @@ function openSettings() {
     dot.title = 'Not signed in';
   }
 
+  renderDebug();
   show('settings');
+}
+
+function renderDebug() {
+  const el = document.getElementById('debugInfo');
+  const lines = [];
+
+  lines.push(`Signed in: ${state.signedIn ? state.userEmail : 'no'}`);
+  lines.push(`SSE: ${state.remoteConnected ? 'connected' : 'disconnected'}`);
+  lines.push(`Online: ${navigator.onLine ? 'yes' : 'no'}`);
+
+  const workspaces = Object.values(state.workspaces)
+    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+
+  if (!workspaces.length) {
+    lines.push('No workspaces.');
+    el.innerHTML = lines.map(l => `<div>${l}</div>`).join('');
+    return;
+  }
+
+  const statusHtml = lines.map(l => `<div>${l}</div>`).join('');
+  const wsHtml = workspaces.map(ws => {
+    const tabs = ws.tabs || [];
+    const updated = timeAgo(ws.updatedAt);
+    const used    = timeAgo(ws.lastUsed);
+    return `<div class="debug-ws">
+      <span class="debug-ws-name">${ws.name}</span>
+      &nbsp;<span style="color:${ws.color}">●</span><br>
+      ${tabs.length} tab${tabs.length !== 1 ? 's' : ''} · updated ${updated} · used ${used}
+      ${tabs.map(t => `<br><span style="opacity:.6;word-break:break-all">${t.url}</span>`).join('')}
+    </div>`;
+  }).join('');
+
+  el.innerHTML = statusHtml + wsHtml;
 }
 
 async function doSignIn() {
@@ -447,6 +496,7 @@ async function loadState() {
   state.remoteConnected    = r.remoteConnected    || false;
 
   updateSyncDot(state.lastSyncAt, state.signedIn, state.remoteConnected);
+  updateSyncBanner(state.signedIn);
   updateQuotaWarn(state.quota);
 }
 
@@ -470,6 +520,7 @@ document.getElementById('btnExport').onclick = exportWorkspaces;
 document.getElementById('btnImport').onclick = importWorkspaces;
 
 document.getElementById('btnSettings').onclick     = openSettings;
+document.getElementById('syncBannerBtn').onclick   = openSettings;
 document.getElementById('btnSettingsBack').onclick  = () => show('main');
 document.getElementById('btnSettingsClose').onclick = () => show('main');
 document.getElementById('btnSignIn').onclick        = doSignIn;
