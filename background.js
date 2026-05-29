@@ -33,7 +33,7 @@ const FIREBASE_DEFAULT_URL = 'https://workspaces-81907-default-rtdb.firebaseio.c
 const FIREBASE_API_KEY = 'AIzaSyDUnUpaM2zr8OyRi8uBNByb_KywuL_zivo';
 
 // Google OAuth 2.0 Client ID — Google Cloud Console → APIs & Services → Credentials
-const GOOGLE_CLIENT_ID = '315279990323-hgqd9pq3788ju1et1nk7ucmqcp7usrq0.apps.googleusercontent.com';
+const GOOGLE_CLIENT_ID = '180138397780-126n16hln4nj0d97qp9ebb9165q58eq8.apps.googleusercontent.com';
 
 // In-memory cache: windowId → { color, name }
 const _windowMeta = {};
