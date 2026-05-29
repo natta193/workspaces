@@ -13,6 +13,8 @@ const state = {
   userEmail: null,
   redirectUrl: null,
   remoteConnected: false,
+  remotePending: false,
+  lastWrittenAt: {},
 };
 
 let formMode = 'create';
@@ -39,34 +41,20 @@ function show(name) {
 }
 
 // ── Sync status dot ────────────────────────────────────────────────────────
-function updateSyncDot(lastSyncAt, signedIn, remoteConnected) {
+function updateSyncDot(signedIn, remoteConnected, remotePending) {
   const dot = document.getElementById('syncDot');
-  if (signedIn) {
-    if (remoteConnected) {
-      dot.className = 'sync-dot ok';
-      dot.title = 'Firebase live sync connected';
-    } else {
-      dot.className = 'sync-dot warn';
-      dot.title = 'Firebase sync offline — changes queued locally';
-    }
-    return;
-  }
-  if (!lastSyncAt) {
+  if (!signedIn) {
     dot.className = 'sync-dot';
-    dot.title = 'Not signed in — click ⚙ to set up sync';
-    return;
-  }
-  const age = Date.now() - lastSyncAt;
-  const min = Math.round(age / 60000);
-  if (age < 10 * 60000) {
+    dot.title = 'Not signed in — click ⚙ to enable sync';
+  } else if (remoteConnected) {
     dot.className = 'sync-dot ok';
-    dot.title = 'Synced ' + (min < 1 ? 'just now' : min + 'm ago');
-  } else if (age < 60 * 60000) {
+    dot.title = 'Firebase live sync connected';
+  } else if (remotePending) {
     dot.className = 'sync-dot warn';
-    dot.title = 'Synced ' + min + 'm ago';
+    dot.title = 'Firebase connecting…';
   } else {
-    dot.className = 'sync-dot err';
-    dot.title = 'Last synced ' + Math.round(age / 3600000) + 'h ago — check Firefox Sync';
+    dot.className = 'sync-dot warn';
+    dot.title = 'Firebase offline — changes queued locally';
   }
 }
 
@@ -404,12 +392,18 @@ function openSettings() {
   document.getElementById('authRedirectUrl').textContent = state.redirectUrl || '';
 
   const dot = document.getElementById('settingsDot');
-  if (signedIn) {
-    dot.className = 'sync-dot ' + (state.remoteConnected ? 'ok' : 'warn');
-    dot.title = state.remoteConnected ? 'Connected' : 'Offline / connecting…';
-  } else {
+  if (!signedIn) {
     dot.className = 'sync-dot';
     dot.title = 'Not signed in';
+  } else if (state.remoteConnected) {
+    dot.className = 'sync-dot ok';
+    dot.title = 'Firebase connected';
+  } else if (state.remotePending) {
+    dot.className = 'sync-dot warn';
+    dot.title = 'Connecting…';
+  } else {
+    dot.className = 'sync-dot warn';
+    dot.title = 'Offline — queued locally';
   }
 
   renderDebug();
@@ -418,35 +412,47 @@ function openSettings() {
 
 function renderDebug() {
   const el = document.getElementById('debugInfo');
-  const lines = [];
 
-  lines.push(`Signed in: ${state.signedIn ? state.userEmail : 'no'}`);
-  lines.push(`SSE: ${state.remoteConnected ? 'connected' : 'disconnected'}`);
-  lines.push(`Online: ${navigator.onLine ? 'yes' : 'no'}`);
+  const sseStatus = state.remoteConnected ? '🟢 connected'
+    : state.remotePending ? '🟡 connecting…' : '🔴 disconnected';
+
+  let html = `<div>Signed in: <b>${state.signedIn ? state.userEmail : 'no'}</b></div>`
+    + `<div>SSE: ${sseStatus}</div>`
+    + `<div>Online: ${navigator.onLine ? 'yes' : 'no'}</div>`;
 
   const workspaces = Object.values(state.workspaces)
     .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
 
   if (!workspaces.length) {
-    lines.push('No workspaces.');
-    el.innerHTML = lines.map(l => `<div>${l}</div>`).join('');
+    el.innerHTML = html + '<div>No workspaces.</div>';
     return;
   }
 
-  const statusHtml = lines.map(l => `<div>${l}</div>`).join('');
-  const wsHtml = workspaces.map(ws => {
-    const tabs = ws.tabs || [];
-    const updated = timeAgo(ws.updatedAt);
-    const used    = timeAgo(ws.lastUsed);
-    return `<div class="debug-ws">
-      <span class="debug-ws-name">${ws.name}</span>
-      &nbsp;<span style="color:${ws.color}">●</span><br>
-      ${tabs.length} tab${tabs.length !== 1 ? 's' : ''} · updated ${updated} · used ${used}
-      ${tabs.map(t => `<br><span style="opacity:.6;word-break:break-all">${t.url}</span>`).join('')}
-    </div>`;
-  }).join('');
+  for (const ws of workspaces) {
+    const tabs    = ws.tabs || [];
+    const written = state.lastWrittenAt[ws.id];
+    const synced  = written && written >= (ws.updatedAt || 0);
+    const syncLabel = !state.signedIn  ? '<span style="color:var(--sub)">● local only</span>'
+      : synced                         ? '<span style="color:var(--grn)">● synced</span>'
+      :                                  '<span style="color:var(--ylw)">● pending sync</span>';
 
-  el.innerHTML = statusHtml + wsHtml;
+    const tabsHtml = tabs.map(t => {
+      const title = t.title && t.title !== t.url ? t.title : new URL(t.url).hostname;
+      return `<div style="padding-left:6px;opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">`
+        + `<a href="${t.url}" style="color:inherit;text-decoration:none" title="${t.url}">${title}</a>`
+        + `</div>`;
+    }).join('');
+
+    html += `<div class="debug-ws">`
+      + `<span class="debug-ws-name">${ws.name}</span> ${syncLabel}<br>`
+      + `${tabs.length} tab${tabs.length !== 1 ? 's' : ''}`
+      + ` · updated ${timeAgo(ws.updatedAt)}`
+      + (written ? ` · pushed ${timeAgo(written)}` : '')
+      + tabsHtml
+      + `</div>`;
+  }
+
+  el.innerHTML = html;
 }
 
 async function doSignIn() {
@@ -459,6 +465,8 @@ async function doSignIn() {
     if (result && result.error) throw new Error(result.error);
     await loadState();
     openSettings();
+    // Re-render after a moment so SSE connection state is accurate
+    setTimeout(async () => { await loadState(); renderDebug(); }, 2000);
   } catch (err) {
     document.getElementById('settingsErr').textContent = 'Sign-in failed: ' + err.message;
     btn.disabled = false;
@@ -494,8 +502,10 @@ async function loadState() {
   state.userEmail          = r.userEmail          || null;
   state.redirectUrl        = r.redirectUrl        || null;
   state.remoteConnected    = r.remoteConnected    || false;
+  state.remotePending      = r.remotePending      || false;
+  state.lastWrittenAt      = r.lastWrittenAt      || {};
 
-  updateSyncDot(state.lastSyncAt, state.signedIn, state.remoteConnected);
+  updateSyncDot(state.signedIn, state.remoteConnected, state.remotePending);
   updateSyncBanner(state.signedIn);
   updateQuotaWarn(state.quota);
 }

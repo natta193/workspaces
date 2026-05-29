@@ -142,8 +142,8 @@ async function getValidAuth() {
 // Called from the SIGN_IN message handler (user-initiated, from popup).
 async function signInWithGoogle() {
   const redirectUrl = browser.identity.getRedirectURL();
+  console.log('[Workspaces] Sign-in: redirect URL =', redirectUrl);
 
-  // Launch Google OAuth implicit flow — returns access_token in hash.
   const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
     client_id:     GOOGLE_CLIENT_ID,
     response_type: 'token',
@@ -153,12 +153,13 @@ async function signInWithGoogle() {
   });
 
   const responseUrl = await browser.identity.launchWebAuthFlow({ url: authUrl, interactive: true });
+  console.log('[Workspaces] Sign-in: OAuth response received');
   const hash = new URL(responseUrl).hash.slice(1);
   const params = new URLSearchParams(hash);
   const accessToken = params.get('access_token');
   if (!accessToken) throw new Error('No access token in Google response');
+  console.log('[Workspaces] Sign-in: got Google access token');
 
-  // Exchange Google access token for a Firebase ID token.
   const fbResp = await fetch(
     `https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=${FIREBASE_API_KEY}`,
     {
@@ -173,7 +174,11 @@ async function signInWithGoogle() {
     }
   );
   const fbData = await fbResp.json();
-  if (fbData.error) throw new Error(fbData.error.message);
+  console.log('[Workspaces] Sign-in: Firebase response keys =', Object.keys(fbData));
+  if (fbData.error || !fbData.idToken) {
+    console.error('[Workspaces] Sign-in: Firebase error =', fbData);
+    throw new Error(fbData.error?.message || `Firebase auth failed: ${JSON.stringify(fbData)}`);
+  }
 
   const auth = {
     idToken:      fbData.idToken,
@@ -1128,6 +1133,8 @@ browser.runtime.onMessage.addListener(async message => {
         signedIn:        isAuthValid(auth),
         userEmail:       auth ? auth.email : null,
         remoteConnected: !!(_sseSource && _sseSource.readyState === EventSource.OPEN),
+        remotePending:   !!(_sseSource && _sseSource.readyState === EventSource.CONNECTING),
+        lastWrittenAt:   { ..._lastWrittenAt },
         redirectUrl:     browser.identity.getRedirectURL(),
       };
     }
