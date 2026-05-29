@@ -97,29 +97,7 @@
       <span class="sync-dot" id="settingsDot" style="margin-left:auto"></span>
     </div>
     <div class="form">
-
-      <!-- Signed-out state -->
-      <div id="authSignedOut">
-        <p class="settings-hint">Sign in with Google to enable live cross-device sync. Your workspaces are stored under your Google account in Firebase.</p>
-        <button class="btn-ok auth-btn" id="btnSignIn">Sign in with Google</button>
-      </div>
-
-      <!-- Signed-in state -->
-      <div id="authSignedIn">
-        <label class="lbl">Signed in as</label>
-        <p class="settings-email" id="authEmail"></p>
-        <button class="btn-danger auth-btn" id="btnSignOut">Sign out</button>
-      </div>
-
-      <!-- Always visible -->
-      <label class="lbl" style="margin-top:8px">OAuth redirect URL</label>
-      <p class="settings-hint">Register in Google Cloud Console → OAuth credentials → Authorised redirect URIs:</p>
-      <p class="settings-redirect" id="authRedirectUrl"></p>
-
-      <div class="form-err" id="settingsErr"></div>
-
-      <!-- Debug section -->
-      <label class="lbl" style="margin-top:10px">Debug</label>
+      <label class="lbl">Sync status</label>
       <div id="debugInfo" class="debug-info"></div>
     </div>
     <div class="btns btns-row">

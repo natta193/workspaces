@@ -9,9 +9,7 @@ const state = {
   windowWorkspaceMap: {},
   lastSyncAt: null,
   quota: null,
-  signedIn: false,
-  userEmail: null,
-  redirectUrl: null,
+  secretConfigured: false,
   remoteConnected: false,
   remotePending: false,
   lastWrittenAt: {},
@@ -41,11 +39,11 @@ function show(name) {
 }
 
 // ── Sync status dot ────────────────────────────────────────────────────────
-function updateSyncDot(signedIn, remoteConnected, remotePending) {
+function updateSyncDot(secretConfigured, remoteConnected, remotePending) {
   const dot = document.getElementById('syncDot');
-  if (!signedIn) {
+  if (!secretConfigured) {
     dot.className = 'sync-dot';
-    dot.title = 'Not signed in — click ⚙ to enable sync';
+    dot.title = 'No secret set — click ⚙ to enable sync';
   } else if (remoteConnected) {
     dot.className = 'sync-dot ok';
     dot.title = 'Firebase live sync connected';
@@ -59,8 +57,8 @@ function updateSyncDot(signedIn, remoteConnected, remotePending) {
 }
 
 // ── Sync banner ────────────────────────────────────────────────────────────
-function updateSyncBanner(signedIn) {
-  document.getElementById('syncBanner').classList.toggle('visible', !signedIn);
+function updateSyncBanner(secretConfigured) {
+  document.getElementById('syncBanner').classList.toggle('visible', !secretConfigured);
 }
 
 // ── Time helper ────────────────────────────────────────────────────────────
@@ -380,30 +378,15 @@ function importWorkspaces() {
 
 // ── Settings view ──────────────────────────────────────────────────────────
 function openSettings() {
-  document.getElementById('settingsErr').textContent = '';
-
-  const signedIn = state.signedIn;
-  document.getElementById('authSignedOut').style.display = signedIn ? 'none' : '';
-  document.getElementById('authSignedIn').style.display  = signedIn ? ''     : 'none';
-
-  if (signedIn) {
-    document.getElementById('authEmail').textContent = state.userEmail || '';
-  }
-  document.getElementById('authRedirectUrl').textContent = state.redirectUrl || '';
-
   const dot = document.getElementById('settingsDot');
-  if (!signedIn) {
-    dot.className = 'sync-dot';
-    dot.title = 'Not signed in';
+  if (!state.secretConfigured) {
+    dot.className = 'sync-dot';       dot.title = 'No secret configured';
   } else if (state.remoteConnected) {
-    dot.className = 'sync-dot ok';
-    dot.title = 'Firebase connected';
+    dot.className = 'sync-dot ok';   dot.title = 'Firebase connected';
   } else if (state.remotePending) {
-    dot.className = 'sync-dot warn';
-    dot.title = 'Connecting…';
+    dot.className = 'sync-dot warn'; dot.title = 'Connecting...';
   } else {
-    dot.className = 'sync-dot warn';
-    dot.title = 'Offline — queued locally';
+    dot.className = 'sync-dot warn'; dot.title = 'Offline - queued locally';
   }
 
   renderDebug();
@@ -412,81 +395,41 @@ function openSettings() {
 
 function renderDebug() {
   const el = document.getElementById('debugInfo');
+  const sseStatus = state.remoteConnected ? 'connected' : state.remotePending ? 'connecting...' : 'disconnected';
 
-  const sseStatus = state.remoteConnected ? '🟢 connected'
-    : state.remotePending ? '🟡 connecting…' : '🔴 disconnected';
-
-  let html = `<div>Signed in: <b>${state.signedIn ? state.userEmail : 'no'}</b></div>`
-    + `<div>SSE: ${sseStatus}</div>`
+  let html = `<div>Secret: <b>${state.secretConfigured ? 'configured' : 'not set'}</b></div>`
+    + `<div>SSE: <b>${sseStatus}</b></div>`
     + `<div>Online: ${navigator.onLine ? 'yes' : 'no'}</div>`;
 
   const workspaces = Object.values(state.workspaces)
     .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
 
-  if (!workspaces.length) {
-    el.innerHTML = html + '<div>No workspaces.</div>';
-    return;
-  }
+  if (!workspaces.length) { el.innerHTML = html + '<div>No workspaces.</div>'; return; }
 
   for (const ws of workspaces) {
     const tabs    = ws.tabs || [];
     const written = state.lastWrittenAt[ws.id];
     const synced  = written && written >= (ws.updatedAt || 0);
-    const syncLabel = !state.signedIn  ? '<span style="color:var(--sub)">● local only</span>'
-      : synced                         ? '<span style="color:var(--grn)">● synced</span>'
-      :                                  '<span style="color:var(--ylw)">● pending sync</span>';
+    const syncLabel = !state.secretConfigured
+      ? '<span style="color:var(--sub)">local only</span>'
+      : synced ? '<span style="color:var(--grn)">synced</span>'
+      : '<span style="color:var(--ylw)">pending</span>';
 
     const tabsHtml = tabs.map(t => {
-      const title = t.title && t.title !== t.url ? t.title : new URL(t.url).hostname;
+      let title = t.title && t.title !== t.url ? t.title : '';
+      try { if (!title) title = new URL(t.url).hostname; } catch (_) { title = t.url; }
       return `<div style="padding-left:6px;opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">`
-        + `<a href="${t.url}" style="color:inherit;text-decoration:none" title="${t.url}">${title}</a>`
-        + `</div>`;
+        + `<a href="${t.url}" style="color:inherit;text-decoration:none" title="${t.url}">${title}</a></div>`;
     }).join('');
 
-    html += `<div class="debug-ws">`
-      + `<span class="debug-ws-name">${ws.name}</span> ${syncLabel}<br>`
-      + `${tabs.length} tab${tabs.length !== 1 ? 's' : ''}`
-      + ` · updated ${timeAgo(ws.updatedAt)}`
-      + (written ? ` · pushed ${timeAgo(written)}` : '')
-      + tabsHtml
-      + `</div>`;
+    html += `<div class="debug-ws"><span class="debug-ws-name">${ws.name}</span> ${syncLabel}<br>`
+      + `${tabs.length} tab${tabs.length !== 1 ? 's' : ''} · updated ${timeAgo(ws.updatedAt)}`
+      + (written ? ` · pushed ${timeAgo(written)}` : '') + tabsHtml + `</div>`;
   }
-
   el.innerHTML = html;
 }
 
-async function doSignIn() {
-  const btn = document.getElementById('btnSignIn');
-  btn.disabled = true;
-  btn.textContent = 'Signing in…';
-  document.getElementById('settingsErr').textContent = '';
-  try {
-    const result = await send({ type: 'SIGN_IN' });
-    if (result && result.error) throw new Error(result.error);
-    await loadState();
-    openSettings();
-    // Re-render after a moment so SSE connection state is accurate
-    setTimeout(async () => { await loadState(); renderDebug(); }, 2000);
-  } catch (err) {
-    document.getElementById('settingsErr').textContent = 'Sign-in failed: ' + err.message;
-    btn.disabled = false;
-    btn.textContent = 'Sign in with Google';
-  }
-}
 
-async function doSignOut() {
-  const btn = document.getElementById('btnSignOut');
-  btn.disabled = true;
-  try {
-    await send({ type: 'SIGN_OUT' });
-    await loadState();
-    openSettings();
-  } catch (err) {
-    console.error('[Workspaces] sign-out failed:', err);
-  } finally {
-    btn.disabled = false;
-  }
-}
 
 // ── Load state ─────────────────────────────────────────────────────────────
 async function loadState() {
@@ -498,15 +441,12 @@ async function loadState() {
   state.colors             = r.colors             || [];
   state.lastSyncAt         = r.lastSyncAt         || null;
   state.quota              = r.quota              || null;
-  state.signedIn           = r.signedIn           || false;
-  state.userEmail          = r.userEmail          || null;
-  state.redirectUrl        = r.redirectUrl        || null;
+  state.secretConfigured   = r.secretConfigured   || false;
   state.remoteConnected    = r.remoteConnected    || false;
   state.remotePending      = r.remotePending      || false;
   state.lastWrittenAt      = r.lastWrittenAt      || {};
 
-  updateSyncDot(state.signedIn, state.remoteConnected, state.remotePending);
-  updateSyncBanner(state.signedIn);
+  updateSyncDot(state.secretConfigured, state.remoteConnected, state.remotePending);
   updateQuotaWarn(state.quota);
 }
 
@@ -533,8 +473,6 @@ document.getElementById('btnSettings').onclick     = openSettings;
 document.getElementById('syncBannerBtn').onclick   = openSettings;
 document.getElementById('btnSettingsBack').onclick  = () => show('main');
 document.getElementById('btnSettingsClose').onclick = () => show('main');
-document.getElementById('btnSignIn').onclick        = doSignIn;
-document.getElementById('btnSignOut').onclick       = doSignOut;
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 (async () => {

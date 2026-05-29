@@ -23,17 +23,9 @@ const STORAGE_KEY_WINDOW_MAP     = 'windowWorkspaceMap';
 const STORAGE_KEY_LIVE_TABS      = 'workspaceLiveTabs';
 const STORAGE_KEY_LAST_SYNC      = 'lastSyncAt';
 const STORAGE_KEY_PENDING_WRITES = 'pendingWrites';
-const STORAGE_KEY_AUTH           = 'authData';
 
-// Firebase Realtime Database — shared by all approved users.
-// Each Google account gets its own path: /users/{firebaseUid}/workspaces/...
 const FIREBASE_DEFAULT_URL = 'https://workspaces-81907-default-rtdb.firebaseio.com';
-
-// Firebase Web API Key — Project Settings → General → Your apps → Web API Key
-const FIREBASE_API_KEY = 'AIzaSyDUnUpaM2zr8OyRi8uBNByb_KywuL_zivo';
-
-// Google OAuth 2.0 Client ID — Google Cloud Console → APIs & Services → Credentials
-const GOOGLE_CLIENT_ID = '180138397780-126n16hln4nj0d97qp9ebb9165q58eq8.apps.googleusercontent.com';
+const FIREBASE_SECRET      = 'SpCh3Iz27HfzGEYtSNJMDW5JgVSq6Nun24nDwqjl';
 
 // In-memory cache: windowId → { color, name }
 const _windowMeta = {};
@@ -44,8 +36,6 @@ const _lastWrittenAt     = {}; // wsId → timestamp (echo suppression)
 let _applyingRemoteDelta = false;
 let _sseSource           = null;
 const _remoteWriteTimers = {};
-let _userId              = null; // Firebase UID, resolved in init()
-let _tokenRefreshTimer   = null;
 
 const SYNC_QUOTA_BYTES = 102400;
 
@@ -87,134 +77,7 @@ async function getQuotaInfo() {
   return { bytes, total: SYNC_QUOTA_BYTES, pct: bytes / SYNC_QUOTA_BYTES };
 }
 
-// ---------------------------------------------------------------------------
-// Google / Firebase authentication
-// ---------------------------------------------------------------------------
-
-async function getStoredAuth() {
-  const data = await browser.storage.local.get(STORAGE_KEY_AUTH);
-  return data[STORAGE_KEY_AUTH] || null;
-}
-
-function isAuthValid(auth) {
-  return auth && auth.idToken && auth.expiresAt && Date.now() < auth.expiresAt - 60_000;
-}
-
-// Exchange a Firebase refresh token for a fresh ID token.
-async function refreshFirebaseToken(auth) {
-  const resp = await fetch(
-    `https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(auth.refreshToken)}`,
-    }
-  );
-  const data = await resp.json();
-  if (data.error || !data.id_token) throw new Error(data.error?.message || 'Token refresh failed');
-
-  const updated = {
-    ...auth,
-    idToken:      data.id_token,
-    refreshToken: data.refresh_token || auth.refreshToken,
-    expiresAt:    Date.now() + parseInt(data.expires_in) * 1000,
-  };
-  await browser.storage.local.set({ [STORAGE_KEY_AUTH]: updated });
-  return updated;
-}
-
-// Returns a valid auth object, refreshing the ID token if it is near expiry.
-// Returns null if no auth is stored or if refresh fails.
-async function getValidAuth() {
-  let auth = await getStoredAuth();
-  if (!auth) return null;
-  if (isAuthValid(auth)) return auth;
-  try {
-    auth = await refreshFirebaseToken(auth);
-    return auth;
-  } catch (err) {
-    console.warn('[Workspaces] Token refresh failed:', err.message);
-    return null;
-  }
-}
-
-// Full Google Sign-In → Firebase ID token exchange.
-// Called from the SIGN_IN message handler (user-initiated, from popup).
-async function signInWithGoogle() {
-  const redirectUrl = browser.identity.getRedirectURL();
-  console.log('[Workspaces] Sign-in: redirect URL =', redirectUrl);
-
-  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-    client_id:     GOOGLE_CLIENT_ID,
-    response_type: 'token',
-    redirect_uri:  redirectUrl,
-    scope:         'openid email profile',
-    prompt:        'select_account',
-  });
-
-  const responseUrl = await browser.identity.launchWebAuthFlow({ url: authUrl, interactive: true });
-  console.log('[Workspaces] Sign-in: OAuth response received');
-  const hash = new URL(responseUrl).hash.slice(1);
-  const params = new URLSearchParams(hash);
-  const accessToken = params.get('access_token');
-  if (!accessToken) throw new Error('No access token in Google response');
-  console.log('[Workspaces] Sign-in: got Google access token');
-
-  const fbResp = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=${FIREBASE_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        postBody:             `access_token=${accessToken}&providerId=google.com`,
-        requestUri:           redirectUrl,
-        returnIdpCredential:  true,
-        returnSecureToken:    true,
-      }),
-    }
-  );
-  const fbData = await fbResp.json();
-  console.log('[Workspaces] Sign-in: Firebase response keys =', Object.keys(fbData));
-  if (fbData.error || !fbData.idToken) {
-    console.error('[Workspaces] Sign-in: Firebase error =', fbData);
-    throw new Error(fbData.error?.message || `Firebase auth failed: ${JSON.stringify(fbData)}`);
-  }
-
-  const auth = {
-    idToken:      fbData.idToken,
-    refreshToken: fbData.refreshToken,
-    localId:      fbData.localId,   // Firebase UID
-    email:        fbData.email,
-    expiresAt:    Date.now() + parseInt(fbData.expiresIn) * 1000,
-  };
-
-  await browser.storage.local.set({ [STORAGE_KEY_AUTH]: auth });
-  return auth;
-}
-
-async function signOut() {
-  await browser.storage.local.remove(STORAGE_KEY_AUTH);
-  clearTimeout(_tokenRefreshTimer);
-  _tokenRefreshTimer = null;
-  _userId = null;
-  if (_sseSource) { _sseSource.close(); _sseSource = null; }
-}
-
-// Schedule proactive token refresh 5 minutes before expiry.
-function scheduleTokenRefresh(auth) {
-  clearTimeout(_tokenRefreshTimer);
-  const delay = Math.max(0, auth.expiresAt - Date.now() - 5 * 60_000);
-  _tokenRefreshTimer = setTimeout(async () => {
-    try {
-      const refreshed = await refreshFirebaseToken(auth);
-      scheduleTokenRefresh(refreshed);
-      // Reconnect SSE with fresh token
-      await setupRemoteListener();
-    } catch (err) {
-      console.warn('[Workspaces] Scheduled token refresh failed:', err.message);
-    }
-  }, delay);
-}
+function getSecret() { return FIREBASE_SECRET; }
 
 // ---------------------------------------------------------------------------
 // ID generation
@@ -582,18 +445,14 @@ async function snapshotAndFlushToSync(windowId) {
 // Remote sync — Firebase Realtime Database via REST + SSE
 // ---------------------------------------------------------------------------
 
-// Builds a Firebase URL scoped to the authenticated user:
-//   {base}/users/{firebaseUid}{path}.json?auth={idToken}
-function buildFirebaseUrl(idToken, path) {
-  const base   = FIREBASE_DEFAULT_URL;
-  const prefix = _userId ? `/users/${encodeURIComponent(_userId)}` : '';
-  const auth   = idToken ? `?auth=${encodeURIComponent(idToken)}` : '';
-  return `${base}${prefix}${path}.json${auth}`;
+function buildFirebaseUrl(secret, path) {
+  const auth = secret ? `?auth=${encodeURIComponent(secret)}` : '';
+  return `${FIREBASE_DEFAULT_URL}${path}.json${auth}`;
 }
 
 async function remoteWrite(wsId, workspaceState) {
-  const auth = await getValidAuth();
-  if (!auth) return; // not signed in — skip remote write
+  const secret = getSecret();
+  if (!secret) return;
 
   if (!_isOnline) {
     await queuePendingWrite(wsId, workspaceState);
@@ -601,7 +460,7 @@ async function remoteWrite(wsId, workspaceState) {
   }
 
   _lastWrittenAt[wsId] = workspaceState.updatedAt;
-  const url = buildFirebaseUrl(auth.idToken, `/workspaces/${wsId}`);
+  const url = buildFirebaseUrl(secret, `/workspaces/${wsId}`);
   try {
     const resp = await fetch(url, {
       method: 'PUT',
@@ -619,9 +478,9 @@ async function remoteWrite(wsId, workspaceState) {
 }
 
 async function remoteDelete(wsId) {
-  const auth = await getValidAuth();
-  if (!auth) return;
-  const url = buildFirebaseUrl(auth.idToken, `/workspaces/${wsId}`);
+  const secret = getSecret();
+  if (!secret) return;
+  const url = buildFirebaseUrl(secret, `/workspaces/${wsId}`);
   try {
     await fetch(url, { method: 'DELETE' });
   } catch (err) {
@@ -640,8 +499,8 @@ async function queuePendingWrite(wsId, workspaceState) {
 }
 
 async function flushOfflineQueue() {
-  const auth = await getValidAuth();
-  if (!auth) return;
+  const secret = getSecret();
+  if (!secret) return;
 
   const data  = await browser.storage.local.get(STORAGE_KEY_PENDING_WRITES);
   const queue = data[STORAGE_KEY_PENDING_WRITES] || {};
@@ -650,8 +509,8 @@ async function flushOfflineQueue() {
   const updated = { ...queue };
   for (const [wsId, { state: queuedState, timestamp }] of Object.entries(queue)) {
     try {
-      const url     = buildFirebaseUrl(auth.idToken, `/workspaces/${wsId}/updatedAt`);
-      const resp    = await fetch(url);
+      const url      = buildFirebaseUrl(secret, `/workspaces/${wsId}/updatedAt`);
+      const resp     = await fetch(url);
       const remoteTs = resp.ok ? (await resp.json()) || 0 : 0;
       if (timestamp > remoteTs) await remoteWrite(wsId, queuedState);
       delete updated[wsId];
@@ -762,10 +621,10 @@ async function applyRemoteDelta(windowId, newTabs, tabGroups) {
 async function setupRemoteListener() {
   if (_sseSource) { _sseSource.close(); _sseSource = null; }
 
-  const auth = await getValidAuth();
-  if (!auth) return; // no auth — sync disabled
+  const secret = getSecret();
+  if (!secret) return;
 
-  const url    = buildFirebaseUrl(auth.idToken, '/workspaces');
+  const url    = buildFirebaseUrl(secret, '/workspaces');
   const source = new EventSource(url);
   _sseSource   = source;
 
@@ -1115,7 +974,6 @@ browser.runtime.onMessage.addListener(async message => {
         browser.storage.local.get(STORAGE_KEY_LAST_SYNC),
         getQuotaInfo(),
       ]);
-      const auth = await getStoredAuth();
       let currentWindowId = null;
       try {
         const win = await browser.windows.getLastFocused({ windowTypes: ['normal'] });
@@ -1128,14 +986,12 @@ browser.runtime.onMessage.addListener(async message => {
         workspaces, currentWorkspaceId, currentWindowId,
         windowWorkspaceMap: map,
         colors: WORKSPACE_COLORS,
-        lastSyncAt:      localData[STORAGE_KEY_LAST_SYNC] || null,
+        lastSyncAt:       localData[STORAGE_KEY_LAST_SYNC] || null,
         quota,
-        signedIn:        isAuthValid(auth),
-        userEmail:       auth ? auth.email : null,
-        remoteConnected: !!(_sseSource && _sseSource.readyState === EventSource.OPEN),
-        remotePending:   !!(_sseSource && _sseSource.readyState === EventSource.CONNECTING),
-        lastWrittenAt:   { ..._lastWrittenAt },
-        redirectUrl:     browser.identity.getRedirectURL(),
+        secretConfigured: true,
+        remoteConnected:  !!(_sseSource && _sseSource.readyState === EventSource.OPEN),
+        remotePending:    !!(_sseSource && _sseSource.readyState === EventSource.CONNECTING),
+        lastWrittenAt:    { ..._lastWrittenAt },
       };
     }
 
@@ -1173,23 +1029,7 @@ browser.runtime.onMessage.addListener(async message => {
     case 'GET_COLORS':
       return { colors: WORKSPACE_COLORS };
 
-    case 'SIGN_IN': {
-      try {
-        const auth = await signInWithGoogle();
-        _userId = auth.localId;
-        scheduleTokenRefresh(auth);
-        await setupRemoteListener();
-        return { success: true, email: auth.email };
-      } catch (err) {
-        console.warn('[Workspaces] Sign-in failed:', err.message);
-        return { error: err.message };
-      }
-    }
 
-    case 'SIGN_OUT': {
-      await signOut();
-      return { success: true };
-    }
 
     case 'EXPORT_WORKSPACES': {
       const [workspaces, live] = await Promise.all([getWorkspaces(), getLiveTabs()]);
@@ -1300,13 +1140,6 @@ async function init() {
     }
   } catch (err) {
     console.warn('[Workspaces] startup URL scan failed:', err.message);
-  }
-
-  // Restore Firebase connection if already signed in
-  const auth = await getValidAuth();
-  if (auth) {
-    _userId = auth.localId;
-    scheduleTokenRefresh(auth);
   }
 
   // Online/offline tracking for the offline queue

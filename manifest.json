@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Workspaces",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "description": "Edge-like workspaces for Firefox with automatic cross-device sync.",
   "author": "Firefox Workspaces",
   "permissions": [
@@ -12,12 +12,7 @@
     "theme",
     "alarms",
     "sessions",
-    "identity",
-    "https://*.firebaseio.com/*",
-    "https://identitytoolkit.googleapis.com/*",
-    "https://securetoken.googleapis.com/*",
-    "https://accounts.google.com/*",
-    "https://oauth2.googleapis.com/*"
+    "https://*.firebaseio.com/*"
   ],
   "browser_action": {
     "default_popup": "popup/popup.html",
