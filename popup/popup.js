@@ -13,6 +13,7 @@ const state = {
   remoteConnected: false,
   remotePending: false,
   lastWrittenAt: {},
+  liveTabs: {},
 };
 
 let formMode = 'create';
@@ -413,7 +414,10 @@ function renderDebug() {
   if (!workspaces.length) { el.innerHTML = html + '<div>No workspaces.</div>'; return; }
 
   for (const ws of workspaces) {
-    const tabs    = ws.tabs || [];
+    const liveEntry = state.liveTabs[ws.id];
+    const tabs = liveEntry
+      ? (Array.isArray(liveEntry) ? liveEntry : liveEntry.tabs || [])
+      : (ws.tabs || []);
     const written = state.lastWrittenAt[ws.id];
     const synced  = written && written >= (ws.updatedAt || 0);
     const syncLabel = !state.secretConfigured
@@ -451,6 +455,7 @@ async function loadState() {
   state.remoteConnected    = r.remoteConnected    || false;
   state.remotePending      = r.remotePending      || false;
   state.lastWrittenAt      = r.lastWrittenAt      || {};
+  state.liveTabs           = r.liveTabs           || {};
 
   updateSyncDot(state.secretConfigured, state.remoteConnected, state.remotePending);
   updateQuotaWarn(state.quota);

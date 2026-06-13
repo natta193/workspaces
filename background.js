@@ -36,6 +36,7 @@ const _lastWrittenAt     = {}; // wsId → timestamp (echo suppression)
 let _applyingRemoteDelta = false;
 let _sseSource           = null;
 const _remoteWriteTimers = {};
+const _lastRemoteSnapshot = {}; // wsId → snapshot sig — prevents echo writes after applying remote deltas
 
 const SYNC_QUOTA_BYTES = 102400;
 
@@ -423,7 +424,8 @@ function parseLiveEntry(entry) {
 }
 
 async function snapshotToLocal(windowId) {
-  const map = await getWindowMap();
+  const [map, workspaces] = await Promise.all([getWindowMap(), getWorkspaces()]);
+  if (!map[String(windowId)]) await recoverWindowMapping(windowId, workspaces, map);
   const workspaceId = map[String(windowId)];
   if (!workspaceId) return;
 
@@ -438,26 +440,28 @@ async function snapshotToLocal(windowId) {
 }
 
 async function snapshotAndFlushToSync(windowId) {
-  const map = await getWindowMap();
+  const [map, workspaces, live] = await Promise.all([getWindowMap(), getWorkspaces(), getLiveTabs()]);
   const workspaceId = map[String(windowId)];
   if (!workspaceId) return;
 
-  const workspaces = await getWorkspaces();
-  const workspace  = workspaces[workspaceId];
+  const workspace = workspaces[workspaceId];
   if (!workspace) return;
 
+  // Try a fresh snapshot; if the window is already closing and tabs are gone, fall back to the
+  // last live snapshot (kept current by snapshotToLocal) rather than losing all tab state.
   let snapshot;
-  try { snapshot = await buildTabSnapshot(windowId); }
-  catch (err) { console.warn('[Workspaces] buildTabSnapshot failed:', err.message); return; }
-  if (!snapshot.tabs.length) return;
+  try { snapshot = await buildTabSnapshot(windowId); } catch (_) {}
+  if (!snapshot || !snapshot.tabs.length) {
+    const entry = live[workspaceId];
+    if (entry) snapshot = parseLiveEntry(entry);
+  }
+  if (!snapshot || !snapshot.tabs.length) return;
 
   workspace.tabs      = snapshot.tabs;
   workspace.tabGroups = snapshot.tabGroups;
   workspace.lastUsed  = Date.now();
   workspace.updatedAt = Date.now();
-
-  const live = await getLiveTabs();
-  live[workspaceId] = snapshot;
+  live[workspaceId]   = snapshot;
 
   await Promise.all([
     saveWorkspaces(workspaces),
@@ -470,6 +474,17 @@ async function snapshotAndFlushToSync(windowId) {
 // ---------------------------------------------------------------------------
 // Remote sync — Firebase Realtime Database via REST + SSE
 // ---------------------------------------------------------------------------
+
+// Fingerprint of a tab snapshot — used to detect whether state actually changed before writing.
+// Includes tab URL, pinned, groupId, and group properties (title/color/collapsed).
+function snapshotSig(snapshot) {
+  const tabs = (snapshot.tabs || []).map(t => [t.url, !!t.pinned, t.groupId || null]);
+  const groups = Object.values(snapshot.tabGroups || {})
+    .map(g => `${g.title}|${g.color}|${g.collapsed ? 1 : 0}`)
+    .sort()
+    .join(',');
+  return JSON.stringify(tabs) + '|' + groups;
+}
 
 function buildFirebaseUrl(secret, path) {
   const auth = secret ? `?auth=${encodeURIComponent(secret)}` : '';
@@ -486,6 +501,7 @@ async function remoteWrite(wsId, workspaceState) {
   }
 
   _lastWrittenAt[wsId] = workspaceState.updatedAt;
+  _lastRemoteSnapshot[wsId] = snapshotSig(workspaceState);
   const url = buildFirebaseUrl(secret, `/workspaces/${wsId}`);
   try {
     const resp = await fetch(url, {
@@ -558,18 +574,21 @@ function scheduleRemoteWrite(windowId) {
     catch (err) { return; }
     if (!tabs.length) return;
 
-    const map = await getWindowMap();
+    const [map, workspaces] = await Promise.all([getWindowMap(), getWorkspaces()]);
+    if (!map[String(windowId)]) await recoverWindowMapping(windowId, workspaces, map);
     const wsId = map[String(windowId)];
     if (!wsId) return;
-
-    const workspaces = await getWorkspaces();
-    const workspace  = workspaces[wsId];
+    const workspace = workspaces[wsId];
     if (!workspace) return;
 
     let snapshot;
     try { snapshot = await buildTabSnapshot(windowId); }
     catch (err) { return; }
     if (!snapshot.tabs.length) return;
+
+    // Skip if the tab state matches what was last written/received — prevents echo loops
+    // where Device B writes back after applying Device A's delta (tabs still loading)
+    if (_lastRemoteSnapshot[wsId] && _lastRemoteSnapshot[wsId] === snapshotSig(snapshot)) return;
 
     await remoteWrite(wsId, {
       ...workspace,
@@ -675,6 +694,7 @@ async function setupRemoteListener() {
 
       workspaces[wsId] = remoteWs;
       changed = true;
+      _lastRemoteSnapshot[wsId] = snapshotSig({ tabs: remoteWs.tabs, tabGroups: remoteWs.tabGroups });
 
       for (const [winIdStr, wId] of Object.entries(map)) {
         if (wId === wsId) {
@@ -1005,7 +1025,7 @@ browser.runtime.onMessage.addListener(async message => {
       const [workspaces, map, localData, quota] = await Promise.all([
         getWorkspaces(),
         getWindowMap(),
-        browser.storage.local.get(STORAGE_KEY_LAST_SYNC),
+        browser.storage.local.get([STORAGE_KEY_LAST_SYNC, STORAGE_KEY_LIVE_TABS]),
         getQuotaInfo(),
       ]);
       let currentWindowId = null;
@@ -1024,6 +1044,7 @@ browser.runtime.onMessage.addListener(async message => {
         windowWorkspaceMap: map,
         colors: WORKSPACE_COLORS,
         lastSyncAt:       localData[STORAGE_KEY_LAST_SYNC] || null,
+        liveTabs:         localData[STORAGE_KEY_LIVE_TABS] || {},
         quota,
         secretConfigured: true,
         remoteConnected:  !!(_sseSource && _sseSource.readyState === EventSource.OPEN),
