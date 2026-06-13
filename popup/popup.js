@@ -13,6 +13,7 @@ const state = {
   remoteConnected: false,
   remotePending: false,
   lastWrittenAt: {},
+  lastSyncedAt: {},
   liveTabs: {},
 };
 
@@ -384,6 +385,13 @@ function importWorkspaces() {
 }
 
 // ── Settings view ──────────────────────────────────────────────────────────
+let _debugRefreshTimer = null;
+
+function stopDebugRefresh() {
+  clearInterval(_debugRefreshTimer);
+  _debugRefreshTimer = null;
+}
+
 function openSettings() {
   const dot = document.getElementById('settingsDot');
   if (!state.secretConfigured) {
@@ -398,6 +406,11 @@ function openSettings() {
 
   renderDebug();
   show('settings');
+
+  stopDebugRefresh();
+  _debugRefreshTimer = setInterval(async () => {
+    try { await loadState(); renderDebug(); } catch (_) {}
+  }, 2000);
 }
 
 function renderDebug() {
@@ -418,8 +431,8 @@ function renderDebug() {
     const tabs = liveEntry
       ? (Array.isArray(liveEntry) ? liveEntry : liveEntry.tabs || [])
       : (ws.tabs || []);
-    const written = state.lastWrittenAt[ws.id];
-    const synced  = written && written >= (ws.updatedAt || 0);
+    const syncedAt = state.lastSyncedAt[ws.id] || 0;
+    const synced   = syncedAt >= (ws.updatedAt || 0);
     const syncLabel = !state.secretConfigured
       ? '<span style="color:var(--sub)">local only</span>'
       : synced ? '<span style="color:var(--grn)">synced</span>'
@@ -434,7 +447,7 @@ function renderDebug() {
 
     html += `<div class="debug-ws"><span class="debug-ws-name">${ws.name}</span> ${syncLabel}<br>`
       + `${tabs.length} tab${tabs.length !== 1 ? 's' : ''} · updated ${timeAgo(ws.updatedAt)}`
-      + (written ? ` · pushed ${timeAgo(written)}` : '') + tabsHtml + `</div>`;
+      + (syncedAt ? ` · synced ${timeAgo(syncedAt)}` : '') + tabsHtml + `</div>`;
   }
   el.innerHTML = html;
 }
@@ -455,6 +468,7 @@ async function loadState() {
   state.remoteConnected    = r.remoteConnected    || false;
   state.remotePending      = r.remotePending      || false;
   state.lastWrittenAt      = r.lastWrittenAt      || {};
+  state.lastSyncedAt       = r.lastSyncedAt       || {};
   state.liveTabs           = r.liveTabs           || {};
 
   updateSyncDot(state.secretConfigured, state.remoteConnected, state.remotePending);
@@ -482,8 +496,8 @@ document.getElementById('btnImport').onclick = importWorkspaces;
 
 document.getElementById('btnSettings').onclick     = openSettings;
 document.getElementById('syncBannerBtn').onclick   = openSettings;
-document.getElementById('btnSettingsBack').onclick  = () => show('main');
-document.getElementById('btnSettingsClose').onclick = () => show('main');
+document.getElementById('btnSettingsBack').onclick  = () => { stopDebugRefresh(); show('main'); };
+document.getElementById('btnSettingsClose').onclick = () => { stopDebugRefresh(); show('main'); };
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 (async () => {

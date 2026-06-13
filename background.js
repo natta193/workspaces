@@ -37,6 +37,7 @@ let _applyingRemoteDelta = false;
 let _sseSource           = null;
 const _remoteWriteTimers = {};
 const _lastRemoteSnapshot = {}; // wsId → snapshot sig — prevents echo writes after applying remote deltas
+const _lastSyncedAt       = {}; // wsId → timestamp of last confirmed sync (our write OR received from remote)
 
 const SYNC_QUOTA_BYTES = 102400;
 
@@ -500,8 +501,9 @@ async function remoteWrite(wsId, workspaceState) {
     return;
   }
 
-  _lastWrittenAt[wsId] = workspaceState.updatedAt;
+  _lastWrittenAt[wsId]      = workspaceState.updatedAt;
   _lastRemoteSnapshot[wsId] = snapshotSig(workspaceState);
+  _lastSyncedAt[wsId]       = workspaceState.updatedAt;
   const url = buildFirebaseUrl(secret, `/workspaces/${wsId}`);
   try {
     const resp = await fetch(url, {
@@ -695,6 +697,7 @@ async function setupRemoteListener() {
       workspaces[wsId] = remoteWs;
       changed = true;
       _lastRemoteSnapshot[wsId] = snapshotSig({ tabs: remoteWs.tabs, tabGroups: remoteWs.tabGroups });
+      _lastSyncedAt[wsId]       = remoteTs;
 
       for (const [winIdStr, wId] of Object.entries(map)) {
         if (wId === wsId) {
@@ -1050,6 +1053,7 @@ browser.runtime.onMessage.addListener(async message => {
         remoteConnected:  !!(_sseSource && _sseSource.readyState === EventSource.OPEN),
         remotePending:    !!(_sseSource && _sseSource.readyState === EventSource.CONNECTING),
         lastWrittenAt:    { ..._lastWrittenAt },
+        lastSyncedAt:     { ..._lastSyncedAt },
       };
     }
 
