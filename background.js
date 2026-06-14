@@ -694,18 +694,40 @@ async function setupRemoteListener() {
       const remoteTs = remoteWs.updatedAt || 0;
       if (remoteTs <= localTs) continue;
 
+      // Check if this workspace is currently open in a window on this device.
+      // If it is, this device owns the tab state — never clobber it with a remote delta.
+      let activeWindowId = null;
+      for (const [winIdStr, wId] of Object.entries(map)) {
+        if (wId === wsId) { activeWindowId = parseInt(winIdStr); break; }
+      }
+
+      if (activeWindowId !== null) {
+        // Workspace is live on this device. Accept name/color metadata changes only;
+        // tabs are authoritative here and must not be overwritten or reloaded.
+        const local = workspaces[wsId];
+        if (local) {
+          const oldColor = local.color;
+          const oldName  = local.name;
+          if (remoteWs.color && remoteWs.color !== oldColor) local.color = remoteWs.color;
+          if (remoteWs.name  && remoteWs.name  !== oldName)  local.name  = remoteWs.name;
+          if (local.color !== oldColor || local.name !== oldName) {
+            workspaces[wsId] = local;
+            changed = true;
+            if (local.color !== oldColor) {
+              updateWindowIcon(activeWindowId, local.color, local.name).catch(() => {});
+              applyWindowTheme(activeWindowId, local.color).catch(() => {});
+            }
+          }
+        }
+        _lastSyncedAt[wsId] = remoteTs;
+        continue;
+      }
+
+      // Workspace is not open locally — apply the full remote update to stored state.
       workspaces[wsId] = remoteWs;
       changed = true;
       _lastRemoteSnapshot[wsId] = snapshotSig({ tabs: remoteWs.tabs, tabGroups: remoteWs.tabGroups });
       _lastSyncedAt[wsId]       = remoteTs;
-
-      for (const [winIdStr, wId] of Object.entries(map)) {
-        if (wId === wsId) {
-          applyRemoteDelta(parseInt(winIdStr), remoteWs.tabs || [], remoteWs.tabGroups)
-            .catch(err => console.warn('[Workspaces] applyRemoteDelta error:', err.message));
-          break;
-        }
-      }
     }
 
     if (changed) await saveWorkspaces(workspaces);
